@@ -1,6 +1,6 @@
 # 🎮 Joy-Con 2 Windows compatibility
 
-This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** to a Windows PC using BLE and vJoy.
+This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** to a Windows PC using BLE and vgamepad (virtual Xbox 360 controller).
 
 ---
 
@@ -14,17 +14,13 @@ This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** 
 
 2. Install Python dependencies :
     ```
-    pip install bleak pyvjoy pynput
+    pip install bleak vgamepad pynput
     ```
 
-4.  Install vJoy :
-    https://sourceforge.net/projects/vjoystick/
-
-5. Configure vJoy :  
-        - Open "Configure vJoy"  
-        - Select controller 1  
-        - Set 24 buttons or higher  
-        - Restart your computer  
+4.  Install ViGEmBus driver (required for vgamepad) :
+    https://github.com/ViGEm/ViGEmBus/releases
+    - Download and install the latest ViGEmBus setup
+    - Restart your computer  
 
 ## 🕹️ Usage
 
@@ -39,7 +35,7 @@ This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** 
 
 4. Confirm that the controller is connected.
         - Search in Windows for "Set up USB game controllers".
-        - You should see "vJoy Device" there.
+        - You should see "Controller (Xbox 360 For Windows)" there.
 
 Your Joy-Con 2 controllers are now connected to your Windows computer.
 
@@ -75,7 +71,8 @@ Note: There are other options under Settings > Controller that you can enable / 
 - Automatic mouse control
 
 ## Repositories
-- [pyvjoy](https://github.com/tidzo/pyvjoy)
+- [vgamepad](https://github.com/yannbouteiller/vgamepad)
+- [ViGEmBus](https://github.com/ViGEm/ViGEmBus)
 - [switch2_controller_research](https://github.com/ndeadly/switch2_controller_research)
 
 ## **NOTICE !**
