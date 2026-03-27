@@ -49,43 +49,81 @@ config = Config().getConfig()
 # Initialize vgamepad device (Xbox 360)
 gamepad = vgamepad.VX360Gamepad()
 
+# Store clients for vibration
+vibration_clients = {}
+# Store event loop for thread-safe callback
+_event_loop = None
+
 # Vibration callback function
-async def send_vibration(client, large_motor, small_motor):
-    """Send vibration command to Joy-Con based on gamepad feedback"""
+async def send_vibration_to_client(client, large_motor, small_motor):
+    """Send vibration command to a specific Joy-Con client"""
     try:
         # Convert 0-255 motor values to Joy-Con vibration format
-        # Scale to 0-255 range for Joy-Con
         left_intensity = min(255, max(0, large_motor))
         right_intensity = min(255, max(0, small_motor))
         
+        # Add deadzone to ignore very small vibration values
+        # This prevents constant micro-vibrations from gyro noise or game idle states
+        DEADZONE = 5  # Ignore values below 5
+        if left_intensity < DEADZONE:
+            left_intensity = 0
+        if right_intensity < DEADZONE:
+            right_intensity = 0
+        
+        # Build rumble data according to joycon2-connector format
+        # Format: 11 bytes
+        # [0] = 0x10 (report ID)
+        # [1] = 0x00 (timer)
+        # [2] = 0x01 (enable vibration)
+        # [3-5] = left motor (amp low, amp high, freq)
+        # [6-8] = right motor (amp low, amp high, freq)
+        # [9-10] = padding
+        
+        if left_intensity == 0 and right_intensity == 0:
+            # Stop vibration - send zeros
+            vibration_data = bytes.fromhex("0a000000000000000000000000")
+        else:
+            print(f"[DEBUG] Sending vibration: left={left_intensity}, right={right_intensity}")
+            
+            # Joy-Con 2 only accepts fixed vibration values
+            # Use the working JOY2_CONNECTED_VIBRATION format with fixed values
+            # Format: 0A 91 01 02 00 [right] 00 00 [left] 00 00 00
+            vibration_data = bytes.fromhex("0A9101020004000001000000")
+            print(f"[DEBUG] Vibration data: {vibration_data.hex()}")
+        
+        await client.write_gatt_char(UUID_CMD, vibration_data)
         if left_intensity > 0 or right_intensity > 0:
-            # Create vibration packet (simplified format)
-            # Joy-Con 2 uses a specific format for vibration
-            left_hex = format(left_intensity, '02x')
-            right_hex = format(right_intensity, '02x')
-            # Send vibration command
-            vibration_data = bytes.fromhex(f"0a91010200{right_hex}0000{left_hex}000000")
-            await client.write_gatt_char(UUID_CMD, vibration_data)
+            print("[DEBUG] Vibration sent successfully")
     except Exception as e:
-        print(f"Vibration error: {e}")
+        print(f"[DEBUG] Vibration error: {e}")
+
+async def send_vibration(large_motor, small_motor):
+    """Send vibration to all connected Joy-Con clients"""
+    tasks = []
+    for side, client in vibration_clients.items():
+        if client:
+            tasks.append(send_vibration_to_client(client, large_motor, small_motor))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 def vibration_callback(client, target, large_motor, small_motor, led_number, user_data):
-    """Callback for gamepad vibration feedback"""
-    # Schedule the async vibration in the event loop
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(send_vibration(client, large_motor, small_motor))
-    except:
-        pass
-
-# Store clients for vibration
-vibration_clients = {}
+    """Callback for gamepad vibration feedback from vgamepad"""
+    print(f"[DEBUG] Vibration callback: large={large_motor}, small={small_motor}")
+    global _event_loop
+    if _event_loop is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(send_vibration(large_motor, small_motor), _event_loop)
+        except Exception as e:
+            print(f"[DEBUG] Vibration callback error: {e}")
+    else:
+        print("[DEBUG] No event loop available")
 
 def register_vibration(client, side):
-    """Register vibration callback for a client"""
+    """Register a client for vibration"""
     vibration_clients[side] = client
-    # Register the callback with vgamepad
-    gamepad.register_notification(lambda client, target, large_motor, small_motor, led_number, user_data: vibration_callback(client, target, large_motor, small_motor, led_number, user_data))
+    # Only register the callback once
+    if len(vibration_clients) == 1:
+        gamepad.register_notification(vibration_callback)
 
 # Initialize mouse loop at the start
 firstCall = False
@@ -210,6 +248,11 @@ async def update(controllerSide, joycon):
 
 
 async def notify_duo_joycons(client, side, data):
+    global _event_loop
+    # Store event loop for thread-safe vibration callback
+    if _event_loop is None:
+        _event_loop = asyncio.get_running_loop()
+    
     # Register vibration callback on first connection
     if side not in vibration_clients:
         register_vibration(client, side)
