@@ -1,5 +1,6 @@
 # 🎮 Joy-Con 2 Windows compatibility
 使用灵码编辑器修改，去除了vjoy并添加了vigembus的支持，双手柄体感正常，游戏震动目前也能实现了。
+
 This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** to a Windows PC using BLE and vgamepad (virtual Xbox 360 controller).
 
 ---
@@ -8,7 +9,7 @@ This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** 
 
 1. Clone this repository :
    ```bash
-   git clone https://github.com/Logan-Gaillard/Joy2Win.git
+   git clone https://github.com/big2cater/Joy2Win-vgamepad.git
    cd Joy2Win
    ```
 
