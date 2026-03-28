@@ -10,7 +10,7 @@ This temporary project allows you to connect your **Nintendo Switch 2 Joy-Con** 
 1. Clone this repository :
    ```bash
    git clone https://github.com/big2cater/Joy2Win-vgamepad.git
-   cd Joy2Win
+   cd Joy2Win-vgamepad
    ```
 
 2. Install Python dependencies :
