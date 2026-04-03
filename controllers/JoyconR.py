@@ -68,6 +68,10 @@ class JoyConRight:
 
     async def update(self, datas):
         # Update button states based on the received data
+        if len(datas) < 24:
+            print(f"[WARNING] Data too short: {len(datas)} bytes")
+            return
+        
         btnDatas = datas[4] << 8 | datas[5]
         JoystickDatas = datas[13:16]
         mouseDatas = datas[16:24]
@@ -159,16 +163,19 @@ def joystick_decoder(data, orientation):
     y_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4)
 
     x = max(0, min((x_raw - X_STICK_MIN) / (X_STICK_MAX - X_STICK_MIN), 1))
-    y = 1 - max(0, min((y_raw - Y_STICK_MIN) / (Y_STICK_MAX - Y_STICK_MIN), 1))
+    y = max(0, min((y_raw - Y_STICK_MIN) / (Y_STICK_MAX - Y_STICK_MIN), 1))
 
     x = int(x * 32768)
     y = int(y * 32768)
 
     if orientation == 1:  # Horizontal orientation
-        # Swap X and Y for horizontal orientation
-        x, y = y, x
-        # Invert Y axis for horizontal orientation
-        x = 32768 - x
+        # For right joycon in horizontal mode, rotate 90 degrees CLOCKWISE
+        # Y+ (up) -> X+ (right), Y- (down) -> X- (left)
+        # X+ (right) -> Y- (down), X- (left) -> Y+ (up)
+        # Values range from 0 to 32768, center is 16384
+        x_new = y              # Keep Y axis for new X (no inversion)
+        y_new = 32768 - x      # Invert X axis for new Y
+        x, y = x_new, y_new
 
     return x, y
 

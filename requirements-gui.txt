@@ -1,0 +1,6 @@
+PyQt5==5.15.9
+bleak==0.21.1
+vgamepad==0.1.0
+numpy==1.26.4
+pywin32==306
+pynput==1.7.6

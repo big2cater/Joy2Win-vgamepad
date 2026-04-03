@@ -10,7 +10,11 @@ class Config:
         "save_mac_address": False,
         "enable_dsu": False,
         "mouse_mode": 0,
-        "mac_address": "FFFFFFFFFFFF"
+        "mac_address": "FFFFFFFFFFFF",
+        "sll_mapping": "",      # SL Left mapping (empty = unmapped)
+        "srl_mapping": "",      # SR Left mapping (empty = unmapped)
+        "slr_mapping": "",      # SL Right mapping (empty = unmapped)
+        "srr_mapping": "",      # SR Right mapping (empty = unmapped)
     }
 
     def __new__(cls, config_path="config.ini"):
@@ -32,29 +36,44 @@ class Config:
             return
 
         config_parser.read(self._config_path)
-        if "Controller" in config_parser:
-            section = config_parser["Controller"]
-            self.controller = int(section.get("controller", self.controller))
-            self.orientation = int(section.get("orientation", self.orientation))
-            self.led_player = str(section.get("led_player", self.led_player))
-            self.save_mac_address = section.get("save_mac_address", str(self.save_mac_address)).lower() == '1'
-            self.enable_dsu = section.get("enable_dsu", str(self.enable_dsu)).lower() == '1'
-            self.mouse_mode = int(section.get("mouse_mode", self.mouse_mode if self.mouse_mode == 0 or self.mouse_mode == 1 or self.mouse_mode == 2 else 0))
         
-            if "Bluetooth" in config_parser:
-                section = config_parser["Bluetooth"]
-                configMacAddress =  section.get("mac_address", self.mac_address)
-                if(configMacAddress and len(configMacAddress) == 12 and all(c in "0123456789ABCDEF" for c in configMacAddress.upper())): # Valid MAC address format like AABBCCDDEEFF
-                    self.mac_address = bytes.fromhex(configMacAddress)[::-1] # Convert mac to little-endian format
-                else:
-                    print(f"Invalid MAC address in {self._config_path}. Using default: {self.mac_address}")
-                    self.mac_address = self._defaults["mac_address"]
-            else:
-                print(f"Section 'Bluetooth' not found in {self._config_path}. disabling save_mac_address.")
-                self.save_mac_address = False
+        # Check for Controller section (case-insensitive)
+        controller_section = None
+        for section_name in ['Controller', 'controller']:
+            if section_name in config_parser:
+                controller_section = config_parser[section_name]
+                break
+        
+        if controller_section:
+            self.controller = int(controller_section.get('controller', self.controller))
+            self.orientation = int(controller_section.get('orientation', self.orientation))
+            self.led_player = str(controller_section.get('led_player', self.led_player))
+            save_mac_val = controller_section.get('save_mac_address', '0')
+            self.save_mac_address = save_mac_val.lower() in ['1', 'true', 'yes']
+            enable_dsu_val = controller_section.get('enable_dsu', '0')
+            self.enable_dsu = enable_dsu_val.lower() in ['1', 'true', 'yes']
+            self.mouse_mode = int(controller_section.get('mouse_mode', self.mouse_mode if self.mouse_mode in [0, 1, 2] else 0))
+            # SL/SR button mappings
+            self.sll_mapping = controller_section.get('sll_mapping', self.sll_mapping)
+            self.srl_mapping = controller_section.get('srl_mapping', self.srl_mapping)
+            self.slr_mapping = controller_section.get('slr_mapping', self.slr_mapping)
+            self.srr_mapping = controller_section.get('srr_mapping', self.srr_mapping)
         else:
             print(f"Section 'Controller' not found in {self._config_path}. Using default values.")
             self._init_defaults()
+            return
+        
+        if "Bluetooth" in config_parser or "bluetooth" in config_parser:
+            section = config_parser["Bluetooth"] if "Bluetooth" in config_parser else config_parser["bluetooth"]
+            configMacAddress = section.get("mac_address", self.mac_address)
+            if(configMacAddress and len(configMacAddress) == 12 and all(c in "0123456789ABCDEF" for c in configMacAddress.upper())): # Valid MAC address format like AABBCCDDEEFF
+                self.mac_address = bytes.fromhex(configMacAddress)[::-1] # Convert mac to little-endian format
+            else:
+                print(f"Invalid MAC address in {self._config_path}. Using default: {self.mac_address}")
+                self.mac_address = self._defaults["mac_address"]
+        else:
+            print(f"Section 'Bluetooth' not found in {self._config_path}. disabling save_mac_address.")
+            self.save_mac_address = False
 
     def getConfig(self):
         return {
@@ -64,5 +83,9 @@ class Config:
             "save_mac_address": self.save_mac_address,
             "enable_dsu": self.enable_dsu,
             "mouse_mode": self.mouse_mode,
-            "mac_address": self.mac_address
+            "mac_address": self.mac_address,
+            "sll_mapping": self.sll_mapping,
+            "srl_mapping": self.srl_mapping,
+            "slr_mapping": self.slr_mapping,
+            "srr_mapping": self.srr_mapping,
         }
