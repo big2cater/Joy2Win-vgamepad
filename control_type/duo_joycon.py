@@ -123,21 +123,48 @@ import time
 import asyncio
 
 
-# Initialize Joy-Con controllers
-joyconLeft = JoyConLeft()
-joyconRight = JoyConRight()
+# Per-pair Joy-Con instances (keyed by pair_id)
+# Each pair gets its own JoyConLeft/JoyConRight to avoid cross-pair data corruption
+_pair_joycons = {}  # pair_id -> {"Left": JoyConLeft, "Right": JoyConRight}
 
-def reset_joycon_instances():
-    """Reset Joy-Con controller instances (called when reconnecting)"""
-    global joyconLeft, joyconRight
-    joyconLeft = JoyConLeft()
-    joyconRight = JoyConRight()
+
+def _get_pair_joycons(pair_id: int):
+    """Get or create Joy-Con instances for a specific pair"""
+    if pair_id not in _pair_joycons:
+        _pair_joycons[pair_id] = {
+            "Left": JoyConLeft(),
+            "Right": JoyConRight(),
+        }
+    return _pair_joycons[pair_id]
+
+
+def reset_joycon_instances(pair_id: int = None):
+    """Reset Joy-Con controller instances for a pair (called when reconnecting).
+
+    If pair_id is None, resets all pairs (legacy behavior).
+    """
+    if pair_id is not None:
+        if pair_id in _pair_joycons:
+            _pair_joycons[pair_id] = {
+                "Left": JoyConLeft(),
+                "Right": JoyConRight(),
+            }
+    else:
+        _pair_joycons.clear()
+
+
+def reset_pair_joycons(pair_id: int):
+    """Reset a specific pair's Joy-Con instances (called on disconnect)."""
+    if pair_id in _pair_joycons:
+        del _pair_joycons[pair_id]
 
 # Read the configuration from config.ini
 config = Config().getConfig()
 
-# Store clients for vibration
+# Store clients for vibration, keyed by pair_id -> {side: client}
 vibration_clients = {}
+# Track which pairs have registered a vibration callback
+_vibration_registered_pairs = set()
 # Store event loop for thread-safe callback
 _event_loop = None
 # Control whether vibration is enabled
@@ -152,6 +179,10 @@ def set_vibration_enabled(enabled):
 async def send_vibration_to_client(client, large_motor, small_motor):
     """Send vibration command to a specific Joy-Con client"""
     try:
+        if not client.is_connected:
+            warning(f"[VIBRATION] client not connected, skipping vibration")
+            return
+
         left_intensity = min(255, max(0, large_motor))
         right_intensity = min(255, max(0, small_motor))
 
@@ -168,21 +199,26 @@ async def send_vibration_to_client(client, large_motor, small_motor):
 
         await client.write_gatt_char(UUID_CMD, vibration_data)
     except Exception as e:
-        pass  # Silent fail
+        error(f"[VIBRATION] write_gatt_char failed: {type(e).__name__}: {e}")
 
-async def send_vibration(large_motor, small_motor):
-    """Send vibration to all connected Joy-Con clients"""
+async def send_vibration(pair_id, large_motor, small_motor):
+    """Send vibration to all connected Joy-Con clients for a specific pair"""
     tasks = []
     combined_intensity = max(large_motor, small_motor)
 
+    pair_clients = vibration_clients.get(pair_id, {})
     for side in ['Left', 'Right']:
-        if side in vibration_clients and vibration_clients[side]:
-            tasks.append(send_vibration_to_client(vibration_clients[side], combined_intensity, combined_intensity))
+        client = pair_clients.get(side)
+        if client:
+            info(f"[VIBRATION] pair={pair_id} side={side} client_connected={client.is_connected} intensity={combined_intensity}")
+            tasks.append(send_vibration_to_client(client, combined_intensity, combined_intensity))
+        else:
+            info(f"[VIBRATION] pair={pair_id} side={side} NO CLIENT REGISTERED")
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-def vibration_callback(client, target, large_motor, small_motor, led_number, user_data):
+def vibration_callback(pair_id, client, target, large_motor, small_motor, led_number, user_data):
     """Callback for gamepad vibration feedback from vgamepad"""
     if not _vibration_enabled:
         return
@@ -190,23 +226,72 @@ def vibration_callback(client, target, large_motor, small_motor, led_number, use
     global _event_loop
     if _event_loop is not None:
         try:
-            asyncio.run_coroutine_threadsafe(send_vibration(large_motor, small_motor), _event_loop)
+            asyncio.run_coroutine_threadsafe(send_vibration(pair_id, large_motor, small_motor), _event_loop)
         except Exception as e:
             pass  # Silent fail
 
+def _make_vibration_callback(pair_id):
+    """Create a vgamepad-compatible vibration callback that captures pair_id via closure"""
+    def callback(client, target, large_motor, small_motor, led_number, user_data):
+        vibration_callback(pair_id, client, target, large_motor, small_motor, led_number, user_data)
+    return callback
+
 def register_vibration(client, side, pair_id: int = 0):
-    """Register a client for vibration"""
-    vibration_clients[side] = client
-    if len(vibration_clients) == 1:
+    """Register/update a client for vibration on a specific pair.
+
+    Always updates the client reference (so reconnected Joy-Cons get
+    their new client stored). Only registers the gamepad callback once
+    per pair (vgamepad.register_notification).
+    """
+    info(f"[VIBRATION] register_vibration called: pair_id={pair_id} side={side}")
+    if pair_id not in vibration_clients:
+        vibration_clients[pair_id] = {}
+    # Always update the client reference — handles reconnection with a new client
+    vibration_clients[pair_id][side] = client
+    info(f"[VIBRATION] vibration_clients now: { {k: list(v.keys()) for k, v in vibration_clients.items()} }")
+
+    # Register the vibration callback on this pair's gamepad only once
+    if pair_id not in _vibration_registered_pairs:
         from controller_manager import get_controller_manager
         manager = get_controller_manager()
         pair = manager.get_pair(pair_id)
         if pair and pair.gamepad:
-            pair.gamepad.register_notification(vibration_callback)
+            try:
+                pair.gamepad.register_notification(_make_vibration_callback(pair_id))
+                _vibration_registered_pairs.add(pair_id)
+                info(f"[VIBRATION] callback registered on gamepad for pair_id={pair_id}")
+            except Exception as e:
+                error(f"[VIBRATION] register_notification failed: {e}")
+        else:
+            warning(f"[VIBRATION] cannot register: pair={pair is not None}, gamepad={pair.gamepad if pair else 'N/A'}")
+
+
+def unregister_vibration(side: str, pair_id: int = 0):
+    """Remove a client from vibration tracking (called on disconnect)."""
+    if pair_id in vibration_clients and side in vibration_clients[pair_id]:
+        del vibration_clients[pair_id][side]
+        info(f"[VIBRATION] unregistered side={side} from pair_id={pair_id}")
+        # If both sides are gone, clean up the pair entry entirely
+        if not vibration_clients[pair_id]:
+            del vibration_clients[pair_id]
+
+
+# Per-pair update locks to serialize gamepad access from Left/Right notifications
+_pair_update_locks = {}
+
+
+def _get_pair_update_lock(pair_id: int):
+    """Get or create an asyncio lock for serializing update() calls per pair."""
+    if pair_id not in _pair_update_locks:
+        _pair_update_locks[pair_id] = asyncio.Lock()
+    return _pair_update_locks[pair_id]
 
 
 # Per-pair state for duo mode
 pair_state = {}
+# Lock to protect pair_state dict fields from concurrent read-modify-write
+# between mouse_loop (thread) and update() (event loop)
+_pair_state_lock = threading.Lock()
 
 # Per-pair mouse enabled state (set from GUI)
 pair_mouse_enabled = {}
@@ -241,13 +326,17 @@ def is_mouse_enabled(pair_id: int) -> bool:
 def mouse_loop():
     """Global mouse loop - handles all pairs"""
     while True:
-        for pair_id, state in pair_state.items():
-            stepX = state['targetX'] // 6
-            stepY = state['targetY'] // 6
-            if stepX != 0 or stepY != 0:
+        with _pair_state_lock:
+            for pair_id, state in pair_state.items():
+                stepX = state['targetX'] // 6
+                stepY = state['targetY'] // 6
+                if stepX != 0 or stepY != 0:
+                    state['targetX'] -= stepX
+                    state['targetY'] -= stepY
+                else:
+                    continue
+                # Move mouse outside the lock to minimize hold time
                 mouse.move(stepX, stepY)
-                state['targetX'] -= stepX
-                state['targetY'] -= stepY
         time.sleep(0.006)
 
 
@@ -255,143 +344,165 @@ mouse = Controller()
 
 
 async def update(pair_id: int = 0):
-    from controller_manager import get_controller_manager
-    manager = get_controller_manager()
-    pair = manager.get_pair(pair_id)
-    if not pair or not pair.gamepad:
-        return
+    # Serialize per-pair updates so Left and Right notifications don't
+    # interleave gamepad writes across an await boundary.
+    async with _get_pair_update_lock(pair_id):
+        from controller_manager import get_controller_manager
+        manager = get_controller_manager()
+        pair = manager.get_pair(pair_id)
+        if not pair or not pair.gamepad:
+            return
 
-    gamepad = pair.gamepad
-    state = get_pair_state(pair_id)
-    controls = get_pair_controls(pair_id)
+        gamepad = pair.gamepad
+        state = get_pair_state(pair_id)
+        controls = get_pair_controls(pair_id)
 
-    # Check if mouse control is enabled for this pair
-    mouse_enabled = is_mouse_enabled(pair_id)
+        # Get per-pair Joy-Con instances
+        pair_joycons = _get_pair_joycons(pair_id)
+        joyconLeft = pair_joycons["Left"]
+        joyconRight = pair_joycons["Right"]
 
-    # Check mouse mode from both Joy-Cons
-    isMouseModeLeft = joyconLeft.mouse["distance"] == "00" or joyconLeft.mouse["distance"] == "01"
-    isMouseModeRight = joyconRight.mouse["distance"] == "00" or joyconRight.mouse["distance"] == "01"
-    
-    if mouse_enabled and state['joyconMouseMode'] is None and (isMouseModeLeft or isMouseModeRight):
-        state['joyconMouseMode'] = "Left" if isMouseModeLeft else "Right"
-    elif not mouse_enabled or (not isMouseModeLeft and not isMouseModeRight):
-        state['joyconMouseMode'] = None
+        # Check if mouse control is enabled for this pair
+        mouse_enabled = is_mouse_enabled(pair_id)
 
-    if state['firstCall'] == False and mouse_enabled and (isMouseModeLeft or isMouseModeRight):
-        threading.Thread(target=mouse_loop, daemon=True).start()
-        state['firstCall'] = True
-
-    # Handle buttons
-    # Left side buttons from joyconLeft
-    for btnName, btnValue in controls["Left"].items():
-        pressed = joyconLeft.buttons.get(btnName, False) if state.get('joyconMouseMode') != "Left" else False
-
-        if btnValue == "LEFT_TRIGGER":
-            if pressed:
-                gamepad.left_trigger(255)
-            else:
-                gamepad.left_trigger(0)
-        elif btnValue == "RIGHT_TRIGGER":
-            if pressed:
-                gamepad.right_trigger(255)
-            else:
-                gamepad.right_trigger(0)
-        elif btnValue is None:
-            pass
-        else:
-            if pressed:
-                gamepad.press_button(btnValue)
-            else:
-                gamepad.release_button(btnValue)
-    
-    # Right side buttons from joyconRight
-    for btnName, btnValue in controls["Right"].items():
-        pressed = joyconRight.buttons.get(btnName, False) if state.get('joyconMouseMode') != "Right" else False
-
-        if btnValue == "LEFT_TRIGGER":
-            if pressed:
-                gamepad.left_trigger(255)
-            else:
-                gamepad.left_trigger(0)
-        elif btnValue == "RIGHT_TRIGGER":
-            if pressed:
-                gamepad.right_trigger(255)
-            else:
-                gamepad.right_trigger(0)
-        elif btnValue is None:
-            pass
-        else:
-            if pressed:
-                gamepad.press_button(btnValue)
-            else:
-                gamepad.release_button(btnValue)
-
-    if state['joyconMouseMode'] != "Left":
-        # Convert 0-32767 (Joy-Con format) to -32768-32767 (Xbox format)
-        left_x_raw = min(joyconLeft.analog_stick["X"], 32767)
-        left_y_raw = min(joyconLeft.analog_stick["Y"], 32767)
-        left_x = int((left_x_raw - 16384) * 2)
-        left_y = int((left_y_raw - 16384) * 2)
-        # Clamp values to valid range
-        left_x = max(-32768, min(32767, left_x))
-        left_y = max(-32768, min(32767, left_y))
-        gamepad.left_joystick(left_x, left_y)
+        # Check mouse mode from both Joy-Cons
+        isMouseModeLeft = joyconLeft.mouse["distance"] == "00" or joyconLeft.mouse["distance"] == "01"
+        isMouseModeRight = joyconRight.mouse["distance"] == "00" or joyconRight.mouse["distance"] == "01"
         
-        # Debug: Print left stick values
-        if config["enable_dsu"] == True:
-            await controller_update(joyconLeft.motionTimestamp, joyconLeft.accelerometer, joyconLeft.gyroscope, slot=pair_id * 2)
+        if mouse_enabled and state['joyconMouseMode'] is None and (isMouseModeLeft or isMouseModeRight):
+            state['joyconMouseMode'] = "Left" if isMouseModeLeft else "Right"
+        elif not mouse_enabled or (not isMouseModeLeft and not isMouseModeRight):
+            state['joyconMouseMode'] = None
 
-    if state['joyconMouseMode'] != "Right":
-        # Convert 0-32767 (Joy-Con format) to -32768-32767 (Xbox format)
-        right_x_raw = min(joyconRight.analog_stick["X"], 32767)
-        right_y_raw = min(joyconRight.analog_stick["Y"], 32767)
-        right_x = int((right_x_raw - 16384) * 2)
-        right_y = int((right_y_raw - 16384) * 2)
-        right_x = max(-32768, min(32767, right_x))
-        right_y = max(-32768, min(32767, right_y))
-        gamepad.right_joystick(right_x, right_y)
+        if state['firstCall'] == False and mouse_enabled and (isMouseModeLeft or isMouseModeRight):
+            threading.Thread(target=mouse_loop, daemon=True).start()
+            state['firstCall'] = True
 
-        if config["enable_dsu"] == True:
-            await controller_update(joyconRight.motionTimestamp, joyconRight.accelerometer, joyconRight.gyroscope, slot=pair_id * 2 + 1)
+        # Handle buttons
+        # Left side buttons from joyconLeft
+        for btnName, btnValue in controls["Left"].items():
+            pressed = joyconLeft.buttons.get(btnName, False) if state.get('joyconMouseMode') != "Left" else False
 
-    gamepad.update()
+            if btnValue == "LEFT_TRIGGER":
+                if pressed:
+                    gamepad.left_trigger(255)
+                else:
+                    gamepad.left_trigger(0)
+            elif btnValue == "RIGHT_TRIGGER":
+                if pressed:
+                    gamepad.right_trigger(255)
+                else:
+                    gamepad.right_trigger(0)
+            elif btnValue is None:
+                pass
+            else:
+                if pressed:
+                    gamepad.press_button(btnValue)
+                else:
+                    gamepad.release_button(btnValue)
+        
+        # Right side buttons from joyconRight
+        for btnName, btnValue in controls["Right"].items():
+            pressed = joyconRight.buttons.get(btnName, False) if state.get('joyconMouseMode') != "Right" else False
 
-    # Handle mouse movement based on which Joy-Con is in mouse mode
-    if state['joyconMouseMode'] == "Left":
-        joycon = joyconLeft
-    elif state['joyconMouseMode'] == "Right":
-        joycon = joyconRight
-    else:
-        joycon = None
-    
-    if joycon is not None:
-        deltaX = (joycon.mouse["X"] - state['previousMouseX'] + 32768) % 65536 - 32768
-        deltaY = (joycon.mouse["Y"] - state['previousMouseY'] + 32768) % 65536 - 32768
-        state['previousMouseX'] = joycon.mouse["X"]
-        state['previousMouseY'] = joycon.mouse["Y"]
+            if btnValue == "LEFT_TRIGGER":
+                if pressed:
+                    gamepad.left_trigger(255)
+                else:
+                    gamepad.left_trigger(0)
+            elif btnValue == "RIGHT_TRIGGER":
+                if pressed:
+                    gamepad.right_trigger(255)
+                else:
+                    gamepad.right_trigger(0)
+            elif btnValue is None:
+                pass
+            else:
+                if pressed:
+                    gamepad.press_button(btnValue)
+                else:
+                    gamepad.release_button(btnValue)
 
-        state['targetX'] += deltaX
-        state['targetY'] += deltaY
+        if state['joyconMouseMode'] != "Left":
+            # Convert 0-32767 (Joy-Con format) to -32768-32767 (Xbox format)
+            left_x_raw = min(joyconLeft.analog_stick["X"], 32767)
+            left_y_raw = min(joyconLeft.analog_stick["Y"], 32767)
+            left_x = int((left_x_raw - 16384) * 2)
+            left_y = int((left_y_raw - 16384) * 2)
+            # Clamp values to valid range
+            left_x = max(-32768, min(32767, left_x))
+            left_y = max(-32768, min(32767, left_y))
+            # Apply deadzone to prevent drift (consistent with single_joycon)
+            DEADZONE = 3000
+            if abs(left_x) < DEADZONE:
+                left_x = 0
+            if abs(left_y) < DEADZONE:
+                left_y = 0
+            gamepad.left_joystick(left_x, left_y)
+            
+            # Debug: Print left stick values
+            if config["enable_dsu"] == True:
+                await controller_update(joyconLeft.motionTimestamp, joyconLeft.accelerometer, joyconLeft.gyroscope, slot=pair_id * 2)
 
-        if joycon.mouseBtn["Left"] == True:
-            if not state['leftPressed']:
-                mouse.press(Button.left)
-            state['leftPressed'] = True
+        if state['joyconMouseMode'] != "Right":
+            # Convert 0-32767 (Joy-Con format) to -32768-32767 (Xbox format)
+            right_x_raw = min(joyconRight.analog_stick["X"], 32767)
+            right_y_raw = min(joyconRight.analog_stick["Y"], 32767)
+            right_x = int((right_x_raw - 16384) * 2)
+            right_y = int((right_y_raw - 16384) * 2)
+            right_x = max(-32768, min(32767, right_x))
+            right_y = max(-32768, min(32767, right_y))
+            # Apply deadzone to prevent drift (consistent with single_joycon)
+            DEADZONE = 3000
+            if abs(right_x) < DEADZONE:
+                right_x = 0
+            if abs(right_y) < DEADZONE:
+                right_y = 0
+            gamepad.right_joystick(right_x, right_y)
+
+            if config["enable_dsu"] == True:
+                await controller_update(joyconRight.motionTimestamp, joyconRight.accelerometer, joyconRight.gyroscope, slot=pair_id * 2 + 1)
+
+        gamepad.update()
+
+        # Handle mouse movement based on which Joy-Con is in mouse mode
+        if state['joyconMouseMode'] == "Left":
+            joycon = joyconLeft
+        elif state['joyconMouseMode'] == "Right":
+            joycon = joyconRight
         else:
-            if state['leftPressed']:
-                mouse.release(Button.left)
-            state['leftPressed'] = False
+            joycon = None
+        
+        if joycon is not None:
+            # Protect targetX/targetY read-modify-write from mouse_loop thread
+            with _pair_state_lock:
+                deltaX = (joycon.mouse["X"] - state['previousMouseX'] + 32768) % 65536 - 32768
+                deltaY = (joycon.mouse["Y"] - state['previousMouseY'] + 32768) % 65536 - 32768
+                state['previousMouseX'] = joycon.mouse["X"]
+                state['previousMouseY'] = joycon.mouse["Y"]
 
-        if joycon.mouseBtn["Right"] == True:
-            if not state['rightPressed']:
-                mouse.press(Button.right)
-            state['rightPressed'] = True
-        else:
-            if state['rightPressed']:
-                mouse.release(Button.right)
-            state['rightPressed'] = False
+                state['targetX'] += deltaX
+                state['targetY'] += deltaY
 
-        mouse.scroll(joycon.mouseBtn["scrollX"] / 32768, joycon.mouseBtn["scrollY"] / 32768)
+            if joycon.mouseBtn["Left"] == True:
+                if not state['leftPressed']:
+                    mouse.press(Button.left)
+                state['leftPressed'] = True
+            else:
+                if state['leftPressed']:
+                    mouse.release(Button.left)
+                state['leftPressed'] = False
+
+            if joycon.mouseBtn["Right"] == True:
+                if not state['rightPressed']:
+                    mouse.press(Button.right)
+                state['rightPressed'] = True
+            else:
+                if state['rightPressed']:
+                    mouse.release(Button.right)
+                state['rightPressed'] = False
+
+            mouse.scroll(joycon.mouseBtn["scrollX"] / 32768, joycon.mouseBtn["scrollY"] / 32768)
 
 
 async def notify_duo_joycons(client, side, data, pair_id: int = 0):
@@ -399,16 +510,33 @@ async def notify_duo_joycons(client, side, data, pair_id: int = 0):
     if _event_loop is None:
         _event_loop = asyncio.get_running_loop()
 
-    if side not in vibration_clients:
-        register_vibration(client, side)
+    # Always update vibration client reference (handles reconnection with new client)
+    # register_vibration always updates the client ref, and only registers the
+    # gamepad callback once per pair, so it's safe to call every time.
+    register_vibration(client, side, pair_id)
+
+    # Get per-pair Joy-Con instances
+    pair_joycons = _get_pair_joycons(pair_id)
 
     if side == "Left":
-        
-        await joyconLeft.update(data)
+        # Sync orientation from JoyConInfo to the JoyCon instance
+        from controller_manager import get_controller_manager
+        manager = get_controller_manager()
+        pair = manager.get_pair(pair_id)
+        if pair and pair.left.is_connected:
+            pair_joycons["Left"].orientation = pair.left.orientation
+
+        await pair_joycons["Left"].update(data)
         await update(pair_id)
     elif side == "Right":
-        
-        await joyconRight.update(data)
+        # Sync orientation from JoyConInfo to the JoyCon instance
+        from controller_manager import get_controller_manager
+        manager = get_controller_manager()
+        pair = manager.get_pair(pair_id)
+        if pair and pair.right.is_connected:
+            pair_joycons["Right"].orientation = pair.right.orientation
+
+        await pair_joycons["Right"].update(data)
         await update(pair_id)
     else:
         warning("Unknown controller side.")

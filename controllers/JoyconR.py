@@ -68,8 +68,8 @@ class JoyConRight:
 
     async def update(self, datas):
         # Update button states based on the received data
-        if len(datas) < 24:
-            print(f"[WARNING] Data too short: {len(datas)} bytes")
+        if len(datas) < 0x3C:
+            print(f"[WARNING] Data too short: {len(datas)} bytes (expected at least {0x3C})")
             return
         
         btnDatas = datas[4] << 8 | datas[5]
@@ -142,7 +142,14 @@ class JoyConRight:
         msg = f"{self.name} {self.side} : low battery ({self.battery_level}%)"
 
         if platform.system() == "Windows":
-            ctypes.windll.user32.MessageBoxW(0, msg, "Alert Joy-Con", 0)
+            import threading
+            # Run MessageBox in a separate thread to avoid blocking the
+            # BLE notification/event-loop thread that processes input.
+            threading.Thread(
+                target=ctypes.windll.user32.MessageBoxW,
+                args=(0, msg, "Alert Joy-Con", 0),
+                daemon=True
+            ).start()
         elif platform.system() == "Linux":
             os.system(f'notify-send "Alert Joy-Con" "{msg}"')
         else:

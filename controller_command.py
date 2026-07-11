@@ -29,6 +29,7 @@ class ControllerCommand:
     onSendCmd = False
     cmdAnswered = False
     clientSending = None
+    _lock = asyncio.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -36,51 +37,52 @@ class ControllerCommand:
         return cls._instance
 
     async def send_command(self, client, commandType, args=None):
-        try:
-            if self.onSendCmd:
+        async with self._lock:
+            try:
+                if self.onSendCmd:
+                    return False
+
+                self.onSendCmd = True
+                self.cmdAnswered = False
+                self.clientSending = client
+
+                command = COMMAND_TYPE[commandType] # Get the command details
+                data = command["data"] # Get the command data
+
+                if command.get("args") and args: # If command requires arguments
+                    for arg in command["args"]: # Get all required arguments
+                        letter = arg["letter"] # Get the letter to replace in hex string
+                        name = arg["name"] # Get the argument name
+                        if name in args: # Check args has the argument
+                            value = str(args[name])
+                            if len(value) == arg["length"]: # Check if the argument length is valid
+                                data = data.replace(letter, value)
+                            else: # If the argument length is invalid
+                                raise ValueError(f"Invalid argument length for: {name}")
+                        else: # If the argument is missing
+                            raise ValueError(f"Missing argument: {name}")
+
+                # Convert hex string to bytes
+                data_bytes = bytes.fromhex(data)
+
+                #print(f"Sending command: {commandType} with data: {data_bytes.hex()}")
+
+                await client.write_gatt_char(UUID_CMD, data_bytes)
+
+                if command["wait_response"]: #If need to wait for a response
+                    while not self.cmdAnswered:
+                        await asyncio.sleep(0.1)
+
+                self.onSendCmd = False
+                self.clientSending = None
+
+                return True
+
+            except Exception as e:
+                self.onSendCmd = False
+                self.clientSending = None
+                print(f"Failed to send command: {e}")
                 return False
-            
-            self.onSendCmd = True
-            self.cmdAnswered = False
-            self.clientSending = client
-
-            command = COMMAND_TYPE[commandType] # Get the command details
-            data = command["data"] # Get the command data
-
-            if command.get("args") and args: # If command requires arguments
-                for arg in command["args"]: # Get all required arguments
-                    letter = arg["letter"] # Get the letter to replace in hex string
-                    name = arg["name"] # Get the argument name
-                    if name in args: # Check args has the argument
-                        value = str(args[name])
-                        if len(value) == arg["length"]: # Check if the argument length is valid
-                            data = data.replace(letter, value)
-                        else: # If the argument length is invalid
-                            raise ValueError(f"Invalid argument length for: {name}")
-                    else: # If the argument is missing
-                        raise ValueError(f"Missing argument: {name}")
-
-            # Convert hex string to bytes
-            data_bytes = bytes.fromhex(data)
-
-            #print(f"Sending command: {commandType} with data: {data_bytes.hex()}")
-
-            await client.write_gatt_char(UUID_CMD, data_bytes)
-            
-            if command["wait_response"]: #If need to wait for a response
-                while not self.cmdAnswered:
-                    await asyncio.sleep(0.1)
-
-            self.onSendCmd = False
-            self.clientSending = None
-
-            return True
-
-        except Exception as e:
-            self.onSendCmd = False
-            self.clientSending = None
-            print(f"Failed to send command: {e}")
-            return False
 
     def receive_response(self, client, data):
         if data and self.clientSending == client:

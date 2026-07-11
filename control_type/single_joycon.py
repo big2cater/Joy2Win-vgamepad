@@ -219,6 +219,10 @@ def set_vibration_enabled(enabled):
 async def send_vibration_to_client(client, large_motor, small_motor):
     """Send vibration command to a specific Joy-Con client"""
     try:
+        if not client.is_connected:
+            print(f"[VIBRATION] client not connected, skipping vibration")
+            return
+
         left_intensity = min(255, max(0, large_motor))
         right_intensity = min(255, max(0, small_motor))
 

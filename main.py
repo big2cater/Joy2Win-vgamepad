@@ -1,4 +1,4 @@
-import asyncio, os
+import asyncio, os, platform
 from typing import Optional
 from bleak import BleakClient, BleakScanner
 from config import Config
@@ -73,7 +73,7 @@ def detect_side_from_name(name: str) -> str:
     return "Unknown"
 
 
-async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = None, mode: str = "auto", orientation: int = 0):
+async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = None, mode: str = "both", orientation: int = 0):
     """Connect to a Joy-Con and assign it to a pair
     
     Args:
@@ -81,7 +81,7 @@ async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = N
         side: "Left" or "Right"
         mac: MAC address
         pair_id: Optional preferred pair ID (0-based)
-        mode: "auto", "left", "right", or "both"
+        mode: "left", "right", or "both"
         orientation: 0=Vertical (default), 1=Horizontal
     """
     global _connected_devices
@@ -149,9 +149,14 @@ async def handle_duo_joycons(client, side: str, pair_id: int, mac: str, orientat
         mac: MAC address
         orientation: 0=Vertical (default), 1=Horizontal
     """
-    # Reset Joy-Con instances to clear old state
-    from control_type.duo_joycon import reset_joycon_instances
-    reset_joycon_instances()
+    # Only reset Joy-Con instances if this is the first Joy-Con in the pair
+    # (avoids clearing the first Joy-Con's state when connecting the second one)
+    from controller_manager import get_controller_manager
+    manager = get_controller_manager()
+    existing_pair = manager.get_pair(pair_id)
+    if existing_pair and not existing_pair.is_active():
+        from control_type.duo_joycon import reset_joycon_instances
+        reset_joycon_instances(pair_id)
     
     from control_type.duo_joycon import notify_duo_joycons
     
@@ -258,6 +263,18 @@ async def initSendControllerCmd(client, controllerName: str, pair_id: int):
     await controllerCommand.send_command(client, "JOY2_INIT_SENSOR_DATA")
     await controllerCommand.send_command(client, "JOY2_START_SENSOR_DATA")
 
+    # Request high-throughput BLE connection parameters on Windows 11 (build >= 22000)
+    # to increase sensor data frequency. Copied from switch2_input_viewer.py by ndeadly.
+    if platform.system() == 'Windows':
+        version = platform.version()
+        build_number = int(version.split('.')[-1])
+        if build_number >= 22000:
+            from bleak.backends.winrt.client import BleakClientWinRT
+            from winrt.windows.devices.bluetooth import BluetoothLEPreferredConnectionParameters
+            backend = client._backend
+            if isinstance(backend, BleakClientWinRT):
+                backend._requester.request_preferred_connection_parameters(BluetoothLEPreferredConnectionParameters.throughput_optimized)
+
 
 async def disconnect_all():
     """Disconnect all connected devices"""
@@ -268,9 +285,9 @@ async def disconnect_all():
         try:
             if client.is_connected:
                 await client.disconnect()
-                print(f"Disconnected {mac}")
+                info(f"Disconnected {mac}")
         except Exception as e:
-            print(f"Error disconnecting {mac}: {e}")
+            error(f"Error disconnecting {mac}: {e}")
     
     _connected_devices.clear()
     
@@ -296,7 +313,7 @@ async def scan_for_joycons():
                 # Skip if already connected
                 if mac in _connected_devices:
                     return
-                print(f"Controller with address: {device.address} found.")
+                info(f"Controller with address: {device.address} found.")
                 device_controller = device
     
     scanner = BleakScanner(scan_callback)
@@ -330,19 +347,19 @@ async def scan_for_joycons_with_side():
                 if mac in _connected_devices:
                     return
                 
-                print(f"Controller with address: {device.address} found.")
+                info(f"Controller with address: {device.address} found.")
                 device_controller = device
                 
                 # Try to detect side from device name
                 device_name = device.name if device.name else ""
                 if device_name:
                     detected_side = detect_side_from_name(device_name)
-                    print(f"Detected side from name '{device_name}': {detected_side}")
+                    info(f"Detected side from name '{device_name}': {detected_side}")
                 else:
                     # If name is None, try to detect from MAC address pattern
                     # Some Joy-Cons have different MAC patterns for L/R
                     # Or check advertisement data for clues
-                    print(f"Device name is None, checking other characteristics...")
+                    info("Device name is None, checking other characteristics...")
                     # For now, we'll rely on user to specify side in GUI
     
     scanner = BleakScanner(scan_callback)
@@ -364,7 +381,7 @@ async def connect_device(device_info: dict) -> bool:
     side = device_info.get('side', 'Unknown')
     mac = device_info.get('mac', '')
     pair_id = device_info.get('pair_id')  # Get preferred pair_id from device_info
-    mode = device_info.get('mode', 'auto')  # Get connection mode
+    mode = device_info.get('mode', 'both')  # Get connection mode
     orientation = device_info.get('orientation', 0)  # Get orientation (0=vertical, 1=horizontal)
     
     if not device:
@@ -377,10 +394,10 @@ async def disconnect_pair_by_id(pair_id: int):
     """Disconnect a specific pair by ID"""
     manager = get_controller_manager()
     pair = manager.get_pair(pair_id)
-    
+
     if not pair:
         return
-    
+
     # Disconnect left
     if pair.left and pair.left.mac_address:
         mac = pair.left.mac_address
@@ -402,7 +419,7 @@ async def disconnect_pair_by_id(pair_id: int):
                 pass
             del _connected_devices[mac]
         await manager.remove_joycon(mac)
-    
+
     # Disconnect right
     if pair.right and pair.right.mac_address:
         mac = pair.right.mac_address
@@ -425,15 +442,20 @@ async def disconnect_pair_by_id(pair_id: int):
             del _connected_devices[mac]
         await manager.remove_joycon(mac)
 
+    # Clean up vibration client references for this pair
+    from control_type.duo_joycon import unregister_vibration
+    unregister_vibration("Left", pair_id)
+    unregister_vibration("Right", pair_id)
+
 
 async def main():
     """Main entry point - CLI mode (manual connection only)"""
-    print("=" * 50)
-    print("Joy2Win - Multi Controller Support")
-    print("Supports up to 4 pairs (8 Joy-Cons)")
-    print("=" * 50)
-    print("Note: Use GUI mode for better experience (python gui.py)")
-    print("=" * 50)
+    info("=" * 50)
+    info("Joy2Win - Multi Controller Support")
+    info("Supports up to 4 pairs (8 Joy-Cons)")
+    info("=" * 50)
+    info("Note: Use GUI mode for better experience (python gui.py)")
+    info("=" * 50)
 
     try:
         # Start DSU server if enabled
@@ -445,7 +467,7 @@ async def main():
             await asyncio.sleep(1)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\nInterrupting...")
+        info("Interrupting...")
     finally:
         await disconnect_all()
-        print("All controllers disconnected.")
+        info("All controllers disconnected.")

@@ -29,6 +29,7 @@ class JoyConInfo:
     battery_level: int = 100
     is_connected: bool = False
     last_seen: float = 0
+    orientation: int = 0  # 0=Vertical, 1=Horizontal
 
 
 @dataclass
@@ -200,27 +201,15 @@ class ControllerManager:
             
             # Determine which side
             if pair.left.mac_address == mac_address:
-                # Clear the left joycon completely
+                # Clear the left joycon connection state
                 pair.left.is_connected = False
                 pair.left.client = None
-                pair.left.mac_address = None
-                pair.left.device = None
-                # Reset orientation and other state
-                pair.left.orientation = 0
-                pair.left.motionTimestamp = 0
-                pair.left.accelerometer = [0.0, 0.0, 0.0]
-                pair.left.gyroscope = [0.0, 0.0, 0.0]
+                pair.left.mac_address = ""
             elif pair.right.mac_address == mac_address:
-                # Clear the right joycon completely
+                # Clear the right joycon connection state
                 pair.right.is_connected = False
                 pair.right.client = None
-                pair.right.mac_address = None
-                pair.right.device = None
-                # Reset orientation and other state
-                pair.right.orientation = 0
-                pair.right.motionTimestamp = 0
-                pair.right.accelerometer = [0.0, 0.0, 0.0]
-                pair.right.gyroscope = [0.0, 0.0, 0.0]
+                pair.right.mac_address = ""
             
             # Check if pair is now empty
             if not pair.is_active():

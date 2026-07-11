@@ -29,8 +29,8 @@ echo.
 echo [信息] 开始打包 Joy2Win-vgamepad...
 echo.
 
-REM Run PyInstaller
-pyinstaller --noconfirm --onefile --windowed --name "Joy2Win-vgamepad" --icon="logo.ico" gui.py
+REM Run PyInstaller with spec file (includes vgamepad DLLs and hidden imports)
+pyinstaller --noconfirm Joy2Win-vgamepad.spec
 
 if exist "dist\Joy2Win-vgamepad.exe" (
     echo.
@@ -42,9 +42,9 @@ if exist "dist\Joy2Win-vgamepad.exe" (
     
     REM Copy config files
     echo [信息] 复制配置文件...
-    copy "config.ini" "dist\config.ini"
-    copy "config-example.ini" "dist\config-example.ini"
-    copy "requirements-gui.txt" "dist\requirements-gui.txt"
+    if exist "config.ini" copy "config.ini" "dist\config.ini"
+    if exist "config-example.ini" copy "config-example.ini" "dist\config-example.ini"
+    if exist "requirements-gui.txt" copy "requirements-gui.txt" "dist\requirements-gui.txt"
     
     echo.
     echo [提示] 请在 dist 目录中运行 Joy2Win-vgamepad.exe

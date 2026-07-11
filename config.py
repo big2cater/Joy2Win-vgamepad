@@ -6,11 +6,11 @@ class Config:
     _defaults = {
         "controller": 0,
         "orientation": 0,
-        "led_player": 0b0001,
+        "led_player": "0001",
         "save_mac_address": False,
         "enable_dsu": False,
         "mouse_mode": 0,
-        "mac_address": "FFFFFFFFFFFF",
+        "mac_address": b'\xFF' * 6,  # Always bytes to avoid type mismatch
         "sll_mapping": "",      # SL Left mapping (empty = unmapped)
         "srl_mapping": "",      # SR Left mapping (empty = unmapped)
         "slr_mapping": "",      # SL Right mapping (empty = unmapped)
@@ -45,14 +45,26 @@ class Config:
                 break
         
         if controller_section:
-            self.controller = int(controller_section.get('controller', self.controller))
-            self.orientation = int(controller_section.get('orientation', self.orientation))
+            try:
+                self.controller = int(controller_section.get('controller', self.controller))
+            except ValueError:
+                print(f"Invalid 'controller' value in {self._config_path}. Using default: {self.controller}")
+            try:
+                self.orientation = int(controller_section.get('orientation', self.orientation))
+            except ValueError:
+                print(f"Invalid 'orientation' value in {self._config_path}. Using default: {self.orientation}")
             self.led_player = str(controller_section.get('led_player', self.led_player))
             save_mac_val = controller_section.get('save_mac_address', '0')
             self.save_mac_address = save_mac_val.lower() in ['1', 'true', 'yes']
             enable_dsu_val = controller_section.get('enable_dsu', '0')
             self.enable_dsu = enable_dsu_val.lower() in ['1', 'true', 'yes']
-            self.mouse_mode = int(controller_section.get('mouse_mode', self.mouse_mode if self.mouse_mode in [0, 1, 2] else 0))
+            try:
+                self.mouse_mode = int(controller_section.get('mouse_mode', self.mouse_mode if self.mouse_mode in [0, 1, 2] else 0))
+                if self.mouse_mode not in [0, 1, 2]:
+                    self.mouse_mode = 0
+            except ValueError:
+                print(f"Invalid 'mouse_mode' value in {self._config_path}. Using default: 0")
+                self.mouse_mode = 0
             # SL/SR button mappings
             self.sll_mapping = controller_section.get('sll_mapping', self.sll_mapping)
             self.srl_mapping = controller_section.get('srl_mapping', self.srl_mapping)

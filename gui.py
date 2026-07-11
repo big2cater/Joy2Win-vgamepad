@@ -336,10 +336,10 @@ class ControllerPairTab(QWidget):
 
         # Connection mode
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("自动检测", "auto")
         self.mode_combo.addItem("仅左手柄", "left")
         self.mode_combo.addItem("仅右手柄", "right")
         self.mode_combo.addItem("双手柄", "both")
+        self.mode_combo.setCurrentIndex(2)  # Default: 双手柄
         self.mode_combo.setStyleSheet("""
             QComboBox {
                 padding: 5px;
@@ -530,12 +530,12 @@ class ControllerPairTab(QWidget):
         
         if pair:
             # Update left joycon orientation
-            if pair.left.is_connected and hasattr(pair.left, 'orientation'):
+            if pair.left.is_connected:
                 pair.left.orientation = orientation
                 info(f"Updated Left Joy-Con orientation to {orientation}")
             
             # Update right joycon orientation
-            if pair.right.is_connected and hasattr(pair.right, 'orientation'):
+            if pair.right.is_connected:
                 pair.right.orientation = orientation
                 info(f"Updated Right Joy-Con orientation to {orientation}")
     
@@ -662,7 +662,7 @@ class ConnectThread(QThread):
     connect_finished = pyqtSignal(str, int, bool)  # device_name, pair_id, success
     connect_error = pyqtSignal(str, int, str)  # device_name, pair_id, error
 
-    def __init__(self, device_info, pair_id, mode="auto", orientation=0):
+    def __init__(self, device_info, pair_id, mode="both", orientation=0):
         super().__init__()
         self.device_info = device_info
         self.pair_id = pair_id
@@ -747,9 +747,9 @@ class AddControllerDialog(QDialog):
 
     device_selected = pyqtSignal(dict)  # Signal emitted when device is selected
 
-    def __init__(self, parent=None, connection_mode="auto", pair_state=None, pair_id=None):
+    def __init__(self, parent=None, connection_mode="both", pair_state=None, pair_id=None):
         super().__init__(parent)
-        self.connection_mode = connection_mode  # "auto", "left", "right", "both"
+        self.connection_mode = connection_mode  # "left", "right", "both"
         self.pair_state = pair_state or {}  # Current pair connection state
         self.pair_id = pair_id  # Store the pair_id (0-based)
         self.setWindowTitle(f"添加手柄 - 手柄组 {pair_id + 1 if pair_id is not None else '?'}")
@@ -772,7 +772,6 @@ class AddControllerDialog(QDialog):
 
         # Instructions based on connection mode
         mode_text = {
-            "auto": "请确保手柄已关机\n然后长按同步按钮（顶部滑轨内侧小孔）3-5 秒\n直到指示灯左右滚动闪烁",
             "left": "请确保左手柄已关机\n然后长按同步按钮（顶部滑轨内侧小孔）3-5 秒\n直到指示灯左右滚动闪烁",
             "right": "请确保右手柄已关机\n然后长按同步按钮（顶部滑轨内侧小孔）3-5 秒\n直到指示灯左右滚动闪烁",
             "both": "请确保手柄已关机\n然后长按同步按钮（顶部滑轨内侧小孔）3-5 秒\n直到指示灯左右滚动闪烁"
@@ -795,7 +794,7 @@ class AddControllerDialog(QDialog):
                 else:
                     mode_text["both"] = "双手柄模式\n\n请先连接左手柄或右手柄\n长按同步按钮 3-5 秒直到指示灯左右滚动闪烁"
         
-        instructions = QLabel(mode_text.get(self.connection_mode, mode_text["auto"]))
+        instructions = QLabel(mode_text.get(self.connection_mode, mode_text["both"]))
         instructions.setStyleSheet("color: #4CAF50; font-size: 13px; qproperty-alignment: AlignCenter;")
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -815,7 +814,6 @@ class AddControllerDialog(QDialog):
         side_layout.addWidget(side_label)
         
         self.side_combo = QComboBox()
-        self.side_combo.addItem("自动检测", "auto")
         self.side_combo.addItem("左手柄 (L)", "Left")
         self.side_combo.addItem("右手柄 (R)", "Right")
         self.side_combo.setStyleSheet("""
@@ -917,12 +915,21 @@ class AddControllerDialog(QDialog):
                 self.status_label.setText(f"找到设备，但无法识别左右")
                 self.status_label.setStyleSheet("color: #FF9800;")
                 self.side_widget.setVisible(True)
-                
-                # Auto-select based on connection mode if possible
+
+                # Auto-select the opposite side based on what's already connected
                 if self.connection_mode == "left":
-                    self.side_combo.setCurrentIndex(1)  # Left
+                    self.side_combo.setCurrentIndex(0)  # Left
                 elif self.connection_mode == "right":
-                    self.side_combo.setCurrentIndex(2)  # Right
+                    self.side_combo.setCurrentIndex(1)  # Right
+                elif self.connection_mode == "both":
+                    # In dual mode, auto-select the side that isn't connected yet
+                    manager = get_controller_manager()
+                    pair = manager.get_pair(self.pair_id)
+                    if pair:
+                        if pair.left.is_connected and not pair.right.is_connected:
+                            self.side_combo.setCurrentIndex(1)  # Right
+                        elif pair.right.is_connected and not pair.left.is_connected:
+                            self.side_combo.setCurrentIndex(0)  # Left
             
             # Enable connect button
             self.ok_btn.setEnabled(True)
@@ -945,19 +952,16 @@ class AddControllerDialog(QDialog):
         device = self.found_device
         
         if device:
-            # Update side based on user selection
-            selected_side = self.side_combo.currentData()
-            
-            if selected_side == "auto":
-                # Use detected side
-                pass
-            elif selected_side in ["Left", "Right"]:
+            # Only override side from combo box when the selection widget is visible
+            # (i.e. auto-detection failed). Otherwise keep the auto-detected side.
+            if self.side_widget.isVisible():
+                selected_side = self.side_combo.currentData()
                 device['side'] = selected_side
-                
+
             # Add pair_id to device info
             if self.pair_id is not None:
                 device['pair_id'] = self.pair_id
-                
+
             self.device_selected.emit(device)
             self.accept()
         else:
@@ -1308,9 +1312,6 @@ class Joy2WinGUI(QMainWindow):
             elif connection_mode == "both" and pair.mode.value == 3:  # BOTH connected
                 QMessageBox.information(self, "提示", f"手柄组 {pair_id + 1} 已满（双手柄已连接）")
                 return
-            elif connection_mode == "auto" and pair.mode.value == 3:
-                QMessageBox.information(self, "提示", f"手柄组 {pair_id + 1} 已满")
-                return
 
         # Set lock
         self.adding_controller_lock = True
@@ -1435,7 +1436,7 @@ class Joy2WinGUI(QMainWindow):
 
         reply = QMessageBox.question(
             self, "确认断开",
-            f"确定要断开车柄组 {pair_id + 1} 吗？",
+            f"确定要断开手柄组 {pair_id + 1} 吗？",
             QMessageBox.Yes | QMessageBox.No
         )
 

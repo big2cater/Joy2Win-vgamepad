@@ -178,14 +178,18 @@ async def controller_update(timestampBytes, accelBytes, gyroBytes, slot=0):
         response = await responseDataController(timestampBytes, accelBytes, gyroBytes, slot)
         await send_message(response, DSUClientAddr)
 
+_dsu_thread = None
+
 def main_dsu():
-    global sendWaitClientMsg, sock
+    global sendWaitClientMsg, sock, _dsu_thread
     if sock is None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((IP_ADDRESS, PORT))
         sock.settimeout(1)
         print(f"DSU Server listening on {IP_ADDRESS}:{PORT}")
-    if sendWaitClientMsg == False and sock is not None:
+    # Start (or restart) the listener thread if not running
+    if _dsu_thread is None or not _dsu_thread.is_alive():
         sendWaitClientMsg = True
         print("Waiting for DSU client to connect...")
-        threading.Thread(target=lambda: asyncio.run(wait_response()), daemon=True).start()
+        _dsu_thread = threading.Thread(target=lambda: asyncio.run(wait_response()), daemon=True)
+        _dsu_thread.start()
