@@ -3,7 +3,7 @@ import struct
 import zlib
 import random
 
-SERVER_ADDR = ("192.168.1.150", 26760)
+SERVER_ADDR = ("127.0.0.1", 26760)
 PROTOCOL_VERSION = 1001
 CLIENT_ID = random.randint(0, 0xFFFFFFFF)
 
@@ -24,7 +24,8 @@ def build_packet(msg_type, payload=b""):
     return full
 
 def send_request_controller_info(sock):
-    payload = struct.pack("<iBBBB", 4, 0, 1, 2, 3)  # ask for slots 0-3
+    slots = tuple(range(8))
+    payload = struct.pack("<i" + "B" * len(slots), len(slots), *slots)
     packet = build_packet(0x100001, payload)
     sock.sendto(packet, SERVER_ADDR)
     print("Sent 0x100001: controller info request")
@@ -36,7 +37,7 @@ def send_request_data_stream(sock, slot=0):
     print(f"Sent 0x100002: start data stream for slot {slot}")
 
 def parse_controller_data(data):
-    if len(data) < 77:
+    if len(data) < 80:
         return
     slot = data[0]
     connected = data[11]
@@ -75,6 +76,8 @@ def run_client():
             continue
 
         print(f"Received data from {addr}: {data.hex()}")
+        if data[16:20] == bytes.fromhex("02001000"):
+            parse_controller_data(data[20:])
 
 if __name__ == "__main__":
     run_client()

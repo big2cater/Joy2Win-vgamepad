@@ -154,6 +154,9 @@ def update_sl_sr_mappings_for_pair(pair_id: int, sll: str, srl: str, slr: str, s
 
 # Per-pair state
 pair_state = {}
+_pair_state_lock = threading.RLock()
+_mouse_threads = {}
+_mouse_events = {}
 
 # Per-pair mouse enabled state (set from GUI)
 pair_mouse_enabled = {}
@@ -171,49 +174,48 @@ def is_mouse_enabled(pair_id: int) -> bool:
 
 def get_pair_state(pair_id: int):
     """Get or create state for a pair"""
-    if pair_id not in pair_state:
-        pair_state[pair_id] = {
-            'joycon': None,
-            'side': None,
-            'mouse': Controller(),
-            'targetX': 0,
-            'targetY': 0,
-            'previousMouseX': 0,
-            'previousMouseY': 0,
-            'leftPressed': False,
-            'rightPressed': False,
-            'firstCall': False,
-            'lastTime': time.time(),
-        }
-    return pair_state[pair_id]
+    with _pair_state_lock:
+        if pair_id not in pair_state:
+            pair_state[pair_id] = _new_pair_state()
+        return pair_state[pair_id]
+
+
+def _new_pair_state():
+    return {
+        'joycon': None,
+        'side': None,
+        'mouse': Controller(),
+        'targetX': 0,
+        'targetY': 0,
+        'previousMouseX': 0,
+        'previousMouseY': 0,
+        'leftPressed': False,
+        'rightPressed': False,
+        'mouse_mode_active': False,
+        'lastTime': time.time(),
+    }
 
 
 def reset_pair_state(pair_id: int):
     """Reset state for a pair (called when reconnecting)"""
-    if pair_id in pair_state:
-        pair_state[pair_id] = {
-            'joycon': None,
-            'side': None,
-            'mouse': Controller(),
-            'targetX': 0,
-            'targetY': 0,
-            'previousMouseX': 0,
-            'previousMouseY': 0,
-            'leftPressed': False,
-            'rightPressed': False,
-            'firstCall': False,
-            'lastTime': time.time(),
-        }
+    with _pair_state_lock:
+        if pair_id in pair_state:
+            old_state = pair_state[pair_id]
+            if old_state['leftPressed']:
+                old_state['mouse'].release(Button.left)
+            if old_state['rightPressed']:
+                old_state['mouse'].release(Button.right)
+            pair_state[pair_id] = _new_pair_state()
+            _mouse_events.setdefault(pair_id, threading.Event()).set()
 
 
-# Control whether vibration is enabled
-_vibration_enabled = True
+# Per-pair vibration setting
+_pair_vibration_enabled = {}
 
 
-def set_vibration_enabled(enabled):
-    """Set whether vibration feedback is enabled"""
-    global _vibration_enabled
-    _vibration_enabled = enabled
+def set_vibration_enabled(enabled, pair_id: int = 0):
+    """Set whether vibration feedback is enabled for one pair."""
+    _pair_vibration_enabled[pair_id] = enabled
 
 
 async def send_vibration_to_client(client, large_motor, small_motor):
@@ -242,43 +244,17 @@ async def send_vibration_to_client(client, large_motor, small_motor):
         print(f"Vibration error: {e}")
 
 
-# Global event loop for vibration callbacks
-_vibration_event_loop = None
-_vibration_thread = None
-
-def _init_vibration_loop():
-    """Initialize a dedicated event loop for vibration callbacks"""
-    global _vibration_event_loop, _vibration_thread
-    
-    if _vibration_event_loop is None:
-        # Create a new event loop in a background thread
-        import threading
-        
-        def run_event_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            global _vibration_event_loop
-            _vibration_event_loop = loop
-            loop.run_forever()
-        
-        _vibration_thread = threading.Thread(target=run_event_loop, daemon=True)
-        _vibration_thread.start()
-        
-        # Wait a bit for the loop to be ready
-        import time
-        while _vibration_event_loop is None:
-            time.sleep(0.01)
+# Reuse the BLE notification loop instead of maintaining another permanent
+# event-loop thread solely for vibration writes.
+_event_loop = None
+_vibration_registered_gamepads = {}
 
 def vibration_callback(client, target, large_motor, small_motor, led_number, user_data):
     """Callback for gamepad vibration feedback from vgamepad"""
-    if not _vibration_enabled:
-        return
-
     pair_id = user_data if user_data is not None else 0
+    if not _pair_vibration_enabled.get(pair_id, True):
+        return
     
-    # Ensure vibration event loop is initialized
-    _init_vibration_loop()
-
     manager = get_controller_manager()
     pair = manager.get_pair(pair_id)
     if not pair:
@@ -291,12 +267,11 @@ def vibration_callback(client, target, large_motor, small_motor, led_number, use
     elif pair.right.is_connected and pair.right.client:
         target_client = pair.right.client
     
-    if target_client:
+    if target_client and _event_loop is not None:
         try:
-            # Use the dedicated vibration event loop
             asyncio.run_coroutine_threadsafe(
                 send_vibration_to_client(target_client, large_motor, small_motor),
-                _vibration_event_loop
+                _event_loop
             )
         except Exception as e:
             pass  # Silent fail
@@ -306,21 +281,39 @@ def register_vibration(pair_id: int):
     """Register vibration callback for a pair"""
     manager = get_controller_manager()
     pair = manager.get_pair(pair_id)
-    if pair and pair.gamepad:
+    if (pair and pair.gamepad
+            and _vibration_registered_gamepads.get(pair_id) is not pair.gamepad):
         pair.gamepad.register_notification(lambda client, target, large_motor, small_motor, led_number, user_data: vibration_callback(client, target, large_motor, small_motor, led_number, pair_id))
+        _vibration_registered_gamepads[pair_id] = pair.gamepad
 
 
 def mouse_loop(pair_id: int):
     """Mouse movement loop for a pair"""
-    state = get_pair_state(pair_id)
+    with _pair_state_lock:
+        wakeup = _mouse_events.setdefault(pair_id, threading.Event())
     while True:
-        stepX = state['targetX'] // 6
-        stepY = state['targetY'] // 6
-        if stepX != 0 or stepY != 0:
-            state['mouse'].move(stepX, stepY)
-            state['targetX'] -= stepX
-            state['targetY'] -= stepY
-        time.sleep(0.006)
+        # Re-fetch state every iteration so reconnect/reset does not leave this
+        # thread operating on an orphaned dictionary.
+        with _pair_state_lock:
+            state = get_pair_state(pair_id)
+            stepX = int(state['targetX'] / 6)
+            stepY = int(state['targetY'] / 6)
+            if stepX == 0 and state['targetX']:
+                stepX = 1 if state['targetX'] > 0 else -1
+            if stepY == 0 and state['targetY']:
+                stepY = 1 if state['targetY'] > 0 else -1
+            if stepX != 0 or stepY != 0:
+                state['targetX'] -= stepX
+                state['targetY'] -= stepY
+                mouse_controller = state['mouse']
+            else:
+                mouse_controller = None
+        if mouse_controller is not None:
+            mouse_controller.move(stepX, stepY)
+            time.sleep(0.006)
+        else:
+            wakeup.wait()
+            wakeup.clear()
 
 
 async def update(joycon, side, orientation, isInMouse, pair_id: int):
@@ -334,7 +327,6 @@ async def update(joycon, side, orientation, isInMouse, pair_id: int):
         return
 
     gamepad = pair.gamepad
-    config = Config().getConfig()
     
     for btnName, btnValue in controls[side][str(orientation)].items():
         pressed = joycon.buttons.get(btnName, False) and not isInMouse
@@ -374,8 +366,9 @@ async def update(joycon, side, orientation, isInMouse, pair_id: int):
         
         gamepad.left_joystick(stick_x, stick_y)
 
-    if config.get("enable_dsu", False):
-        await controller_update(joycon.motionTimestamp, joycon.accelerometer, joycon.gyroscope, slot=pair_id * 2)
+    if Config().enable_dsu:
+        slot = pair_id * 2 + (1 if side == "Right" else 0)
+        await controller_update(joycon.motionTimestamp, joycon.accelerometer, joycon.gyroscope, slot=slot)
 
     gamepad.update()
 
@@ -384,28 +377,45 @@ async def controller_traitement(joycon, side, orientation, data, pair_id: int):
     """Process controller data for single Joy-Con mode"""
     state = get_pair_state(pair_id)
 
-    isMouseMode = joycon.mouse["distance"] == "00" or joycon.mouse["distance"] == "01"
-    # Check if mouse control is enabled for this pair
-    mouse_enabled = is_mouse_enabled(pair_id)
-
-    if mouse_enabled and state['firstCall'] == False and isMouseMode == True:
-        threading.Thread(target=mouse_loop, args=(pair_id,), daemon=True).start()
-        state['firstCall'] = True
-
     if joycon.orientation != orientation:
         joycon.orientation = orientation
 
     await joycon.update(data)
+
+    # Determine mode from this report, not the previous report.
+    isMouseMode = joycon.mouse["distance"] in ("00", "01")
+    mouse_enabled = is_mouse_enabled(pair_id)
+    if mouse_enabled and isMouseMode:
+        with _pair_state_lock:
+            mouse_thread = _mouse_threads.get(pair_id)
+            if mouse_thread is None or not mouse_thread.is_alive():
+                mouse_thread = threading.Thread(target=mouse_loop, args=(pair_id,), daemon=True)
+                _mouse_threads[pair_id] = mouse_thread
+                mouse_thread.start()
+
     await update(joycon, side, orientation, isMouseMode and mouse_enabled, pair_id)
 
-    if mouse_enabled and isMouseMode:
-        deltaX = (joycon.mouse["X"] - state['previousMouseX'] + 32768) % 65536 - 32768
-        deltaY = (joycon.mouse["Y"] - state['previousMouseY'] + 32768) % 65536 - 32768
-        state['previousMouseX'] = joycon.mouse["X"]
-        state['previousMouseY'] = joycon.mouse["Y"]
-
-        state['targetX'] += deltaX
-        state['targetY'] += deltaY
+    mouse_active = mouse_enabled and isMouseMode
+    if mouse_active:
+        with _pair_state_lock:
+            if not state['mouse_mode_active']:
+                # Establish a baseline when entering mouse mode so stale input
+                # coordinates cannot produce a one-frame cursor jump.
+                state['previousMouseX'] = joycon.mouse['X']
+                state['previousMouseY'] = joycon.mouse['Y']
+                state['targetX'] = 0
+                state['targetY'] = 0
+                state['mouse_mode_active'] = True
+                deltaX = deltaY = 0
+            else:
+                deltaX = (joycon.mouse["X"] - state['previousMouseX'] + 32768) % 65536 - 32768
+                deltaY = (joycon.mouse["Y"] - state['previousMouseY'] + 32768) % 65536 - 32768
+                state['previousMouseX'] = joycon.mouse["X"]
+                state['previousMouseY'] = joycon.mouse["Y"]
+            state['targetX'] += deltaX
+            state['targetY'] += deltaY
+            if deltaX or deltaY:
+                _mouse_events.setdefault(pair_id, threading.Event()).set()
 
         if joycon.mouseBtn["Left"] == True:
             if not state['leftPressed']:
@@ -425,7 +435,19 @@ async def controller_traitement(joycon, side, orientation, data, pair_id: int):
                 state['mouse'].release(Button.right)
             state['rightPressed'] = False
 
-        state['mouse'].scroll(joycon.mouseBtn["scrollX"] / 32768, joycon.mouseBtn["scrollY"] / 32768)
+        scroll_x = int(joycon.mouseBtn["scrollX"] / 32768)
+        scroll_y = int(joycon.mouseBtn["scrollY"] / 32768)
+        if scroll_x or scroll_y:
+            state['mouse'].scroll(scroll_x, scroll_y)
+    else:
+        with _pair_state_lock:
+            if state['leftPressed']:
+                state['mouse'].release(Button.left)
+            if state['rightPressed']:
+                state['mouse'].release(Button.right)
+            state['leftPressed'] = False
+            state['rightPressed'] = False
+            state['mouse_mode_active'] = False
 
     # Latency calculation
     currentTime = time.time()
@@ -435,8 +457,16 @@ async def controller_traitement(joycon, side, orientation, data, pair_id: int):
 
 async def notify_single_joycons(client, side, orientation, data, pair_id: int):
     """Handle notifications for single Joy-Con mode"""
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.get_running_loop()
     state = get_pair_state(pair_id)
     manager = get_controller_manager()
+    pair = manager.get_pair(pair_id)
+    if pair:
+        # Read the current GUI-controlled orientation on every report rather
+        # than retaining the value captured when notifications were started.
+        orientation = pair.left.orientation if side == "Left" else pair.right.orientation
 
     # Initialize joycon object if needed
     if state['joycon'] is None:
@@ -451,7 +481,8 @@ async def notify_single_joycons(client, side, orientation, data, pair_id: int):
 
     await controller_traitement(state['joycon'], side, orientation, data, pair_id)
 
-    # Update battery
-    manager.update_battery(mac, int(state['joycon'].battery_level))
+    # Only publish a verified battery value. Unknown must not become 0%.
+    if state['joycon'].battery_level is not None:
+        manager.update_battery(mac, int(state['joycon'].battery_level))
 
     return client

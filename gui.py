@@ -23,6 +23,20 @@ from logger_config import info, warning, error, debug
 
 # Import controller manager
 from controller_manager import get_controller_manager
+from config import Config
+
+
+def persist_dsu_setting(enabled: bool, config_path='config.ini'):
+    """Update only enable_dsu while preserving every other config section."""
+    import configparser
+    parser = configparser.ConfigParser()
+    if os.path.exists(config_path):
+        parser.read(config_path, encoding='utf-8')
+    if 'Controller' not in parser:
+        parser['Controller'] = {}
+    parser['Controller']['enable_dsu'] = '1' if enabled else '0'
+    with open(config_path, 'w', encoding='utf-8') as configfile:
+        parser.write(configfile)
 
 # Xbox button mapping options
 XBOX_BUTTONS = {
@@ -376,7 +390,7 @@ class ControllerPairTab(QWidget):
         # DSU slot
         self.dsu_check = QCheckBox("启用 DSU 体感映射")
         self.dsu_check.setStyleSheet("color: white;")
-        self.dsu_check.setChecked(True)
+        self.dsu_check.setChecked(Config().enable_dsu)
         self.dsu_check.stateChanged.connect(self.on_dsu_changed)
         settings_layout.addRow("", self.dsu_check)
         
@@ -466,6 +480,36 @@ class ControllerPairTab(QWidget):
         
         self.setLayout(layout)
     
+    @staticmethod
+    def _set_battery_display(progress_bar, battery_level, connected, is_charging=False):
+        color = "#777777"
+        if not connected:
+            progress_bar.setFormat("%p%")
+            progress_bar.setValue(0)
+        elif battery_level is None:
+            progress_bar.setValue(0)
+            progress_bar.setFormat("未知")
+        else:
+            progress_bar.setFormat("充电中 %p%" if is_charging else "%p%")
+            progress_bar.setValue(max(0, min(100, int(battery_level))))
+            if is_charging:
+                color = "#2196F3"
+            elif battery_level <= 11:
+                color = "#F44336"
+            elif battery_level <= 33:
+                color = "#FF9800"
+            else:
+                color = "#4CAF50"
+        progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: 1px solid gray;
+                border-radius: 3px;
+                text-align: center;
+                height: 20px;
+            }}
+            QProgressBar::chunk {{ background-color: {color}; }}
+        """)
+
     def update_status(self, pair):
         """Update display with pair status"""
         if not pair or not pair.is_active():
@@ -473,10 +517,10 @@ class ControllerPairTab(QWidget):
             self.mode_label.setStyleSheet("color: gray; font-size: 16px; font-weight: bold;")
             self.left_status.setText("未连接")
             self.left_status.setStyleSheet("color: gray;")
-            self.left_battery.setValue(0)
+            self._set_battery_display(self.left_battery, None, False)
             self.right_status.setText("未连接")
             self.right_status.setStyleSheet("color: gray;")
-            self.right_battery.setValue(0)
+            self._set_battery_display(self.right_battery, None, False)
             return
         
         # Update mode
@@ -494,21 +538,25 @@ class ControllerPairTab(QWidget):
         if pair.left.is_connected:
             self.left_status.setText("已连接")
             self.left_status.setStyleSheet("color: #4CAF50;")
-            self.left_battery.setValue(pair.left.battery_level)
+            self._set_battery_display(
+                self.left_battery, pair.left.battery_level, True, pair.left.is_charging
+            )
         else:
             self.left_status.setText("未连接")
             self.left_status.setStyleSheet("color: gray;")
-            self.left_battery.setValue(0)
+            self._set_battery_display(self.left_battery, None, False)
         
         # Update Right
         if pair.right.is_connected:
             self.right_status.setText("已连接")
             self.right_status.setStyleSheet("color: #4CAF50;")
-            self.right_battery.setValue(pair.right.battery_level)
+            self._set_battery_display(
+                self.right_battery, pair.right.battery_level, True, pair.right.is_charging
+            )
         else:
             self.right_status.setText("未连接")
             self.right_status.setStyleSheet("color: gray;")
-            self.right_battery.setValue(0)
+            self._set_battery_display(self.right_battery, None, False)
 
     def on_mouse_changed(self, state):
         """Handle mouse control checkbox change"""
@@ -549,26 +597,25 @@ class ControllerPairTab(QWidget):
             from config import Config
             config = Config()
             config.enable_dsu = enabled
+            window = self.window()
+            for tab in getattr(window, 'controller_tabs', []):
+                if tab is self:
+                    continue
+                tab.dsu_check.blockSignals(True)
+                tab.dsu_check.setChecked(enabled)
+                tab.dsu_check.blockSignals(False)
             
-            # Save to config file
-            import configparser
-            parser = configparser.ConfigParser()
-            parser['Controller'] = {
-                'controller': str(config.controller),
-                'orientation': str(config.orientation),
-                'led_player': str(config.led_player),
-                'save_mac_address': '1' if config.save_mac_address else '0',
-                'enable_dsu': '1' if enabled else '0',
-                'mouse_mode': str(config.mouse_mode),
-                'sll_mapping': config.sll_mapping,
-                'srl_mapping': config.srl_mapping,
-                'slr_mapping': config.slr_mapping,
-                'srr_mapping': config.srr_mapping,
-            }
-            
-            with open('config.ini', 'w') as configfile:
-                parser.write(configfile)
+            persist_dsu_setting(enabled)
             info(f"DSU setting saved to config")
+            if enabled:
+                # Enabling DSU while the app is already running must also
+                # start its listener; previously this only took effect after
+                # a full restart.
+                from dsu_server import main_dsu
+                main_dsu()
+            else:
+                from dsu_server import stop_dsu
+                stop_dsu()
         except Exception as e:
             error(f"Failed to save DSU setting: {e}")
     
@@ -582,8 +629,8 @@ class ControllerPairTab(QWidget):
             from control_type.duo_joycon import set_vibration_enabled as duo_set_vib
             from control_type.single_joycon import set_vibration_enabled as single_set_vib
             
-            duo_set_vib(enabled)
-            single_set_vib(enabled)
+            duo_set_vib(enabled, self.pair_id)
+            single_set_vib(enabled, self.pair_id)
             info(f"Vibration setting applied")
         except Exception as e:
             error(f"Failed to set vibration: {e}")

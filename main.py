@@ -1,19 +1,23 @@
-import asyncio, os, platform
+import asyncio, os, platform, time
 from typing import Optional
 from bleak import BleakClient, BleakScanner
 from config import Config
-from controller_command import ControllerCommand, UUID_NOTIFY, UUID_CMD_RESPONSE
+from controller_command import (
+    ControllerCommand,
+    UUID_NOTIFY,
+    UUID_CMD_RESPONSE,
+    UUID_POWER_LEFT,
+    UUID_POWER_RIGHT,
+)
 from dsu_server import main_dsu
 from controller_manager import get_controller_manager, ControllerMode
 from logger_config import info, warning, error, debug
+from controllers.battery import battery_percentage_from_voltage
 
 # Check if the operating system is Windows
 if(os.name != 'nt'):
     error("This application is only supported on Windows.")
     exit(1)
-
-# Read the configuration from config.ini
-config = Config().getConfig()
 
 manufact = {
     "id": 0x0553,  # Nintendo Co., Ltd.
@@ -23,6 +27,17 @@ manufact = {
 # Global state
 _connected_devices = {}  # mac_address -> (client, side, pair_id)
 _main_event_loop = None  # Reference to main event loop for callbacks
+_notification_error_last = {}
+_low_battery_counts = {}
+_low_battery_alerted = set()
+
+
+def log_notification_error(key: str, exc: Exception, interval: float = 5.0):
+    """Log recurring BLE notification failures at a bounded rate."""
+    now = time.monotonic()
+    if now - _notification_error_last.get(key, 0) >= interval:
+        _notification_error_last[key] = now
+        warning(f"{key}: {type(exc).__name__}: {exc}")
 
 
 def set_event_loop(loop):
@@ -39,6 +54,119 @@ def get_event_loop():
 def get_mac_from_device(device):
     """Extract MAC address from device"""
     return device.address.replace(":", "").replace("-", "").upper()
+
+
+def get_power_report_uuid(side: str):
+    if side == "Left":
+        return UUID_POWER_LEFT
+    if side == "Right":
+        return UUID_POWER_RIGHT
+    raise ValueError(f"Unknown Joy-Con side: {side}")
+
+
+def get_player_led_value(pair_id: int):
+    if not 0 <= pair_id < 4:
+        raise ValueError(f"Invalid pair_id: {pair_id}")
+    return format(1 << pair_id, 'x')
+
+
+def handle_power_report(mac: str, data, side: str = "Joy-Con 2"):
+    """Decode Joy-Con 2 report 0x07/0x08 power information."""
+    if len(data) < 2:
+        return
+    power_info = data[1]
+    external_power = bool(power_info & 0x01)
+    is_charging = bool(power_info & 0x02)
+    battery_units = (power_info >> 2) & 0x0F
+    if battery_units > 9:
+        debug(f"Ignoring invalid Joy-Con 2 battery level: {battery_units}")
+        return
+    battery_level = round(battery_units * 100 / 9)
+    get_controller_manager().update_battery(
+        mac,
+        battery_level,
+        is_charging=is_charging,
+        external_power=external_power,
+    )
+    info(f"Joy-Con 2 {side} battery level: {battery_units}/9 ({battery_level}%)")
+
+
+async def capture_power_level(client, side: str, mac: str, timeout: float = 1.5):
+    """Capture one native 0-9 battery report before selecting report 0x05.
+
+    Keeping report 0x07/0x08 subscribed after sensor initialisation can stop the
+    main button/IMU stream on real controllers. A short pre-initialisation
+    subscription obtains the controller's own state-of-charge value and is
+    removed before report 0x05 is enabled.
+    """
+    received = asyncio.Event()
+
+    def power_handler(sender, data):
+        try:
+            handle_power_report(mac, data, side)
+            received.set()
+        except Exception as exc:
+            debug(f"Failed to decode {side} power report: {exc}")
+
+    uuid = get_power_report_uuid(side)
+    started = False
+    try:
+        await client.start_notify(uuid, power_handler)
+        started = True
+        await asyncio.wait_for(received.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        debug(f"Timed out waiting for {side} native battery report")
+        return False
+    except Exception as exc:
+        debug(f"Unable to capture {side} native battery report: {exc}")
+        return False
+    finally:
+        if started:
+            try:
+                await client.stop_notify(uuid)
+            except Exception as exc:
+                debug(f"Unable to stop {side} battery report: {exc}")
+
+
+async def cleanup_failed_connection(client, side: str, mac: str, pair_id=None):
+    """Release resources left by a failed or partial BLE initialisation."""
+    _connected_devices.pop(mac, None)
+    _low_battery_counts.pop(mac, None)
+    _low_battery_alerted.discard(mac)
+    try:
+        if client.is_connected:
+            notify_uuids = [UUID_NOTIFY, UUID_CMD_RESPONSE]
+            try:
+                notify_uuids.append(get_power_report_uuid(side))
+            except ValueError:
+                pass
+            for uuid in notify_uuids:
+                try:
+                    await client.stop_notify(uuid)
+                except Exception:
+                    pass
+            await client.disconnect()
+    except Exception as exc:
+        debug(f"Cleanup disconnect failed for {mac}: {exc}")
+
+    manager = get_controller_manager()
+    if pair_id is None:
+        mapped_pair = manager.get_pair_by_mac(mac)
+        pair_id = mapped_pair.pair_id if mapped_pair else None
+    await manager.remove_joycon(mac)
+
+    if pair_id is not None:
+        pair = manager.get_pair(pair_id)
+        pair_empty = pair is None or not pair.is_active()
+        try:
+            from control_type.duo_joycon import cleanup_disconnected_joycon, unregister_vibration
+            unregister_vibration(side, pair_id)
+            cleanup_disconnected_joycon(pair_id, side, pair_empty)
+            from control_type.single_joycon import reset_pair_state
+            reset_pair_state(pair_id)
+        except Exception as exc:
+            debug(f"State cleanup failed for pair {pair_id}: {exc}")
 
 
 def detect_side_from_name(name: str) -> str:
@@ -85,11 +213,27 @@ async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = N
         orientation: 0=Vertical (default), 1=Horizontal
     """
     global _connected_devices
-    
+
     manager = get_controller_manager()
+    assigned_pair_id = None
+    connection_loop = asyncio.get_running_loop()
+
+    def disconnected_callback(disconnected_client):
+        if connection_loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            cleanup_failed_connection(
+                disconnected_client, side, mac, assigned_pair_id
+            ),
+            connection_loop,
+        )
     
     # Try to connect
-    client = BleakClient(device, timeout=10.0)  # Increase timeout to 10 seconds
+    client = BleakClient(
+        device,
+        timeout=10.0,
+        disconnected_callback=disconnected_callback,
+    )
     try:
         info(f"Attempting to connect to {mac} ({device.name})...")
         await client.connect()
@@ -106,6 +250,7 @@ async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = N
             warning(f"No available slot for {side} Joy-Con {mac}")
             await client.disconnect()
             return False
+        assigned_pair_id = pair_id_result
         
         pair = manager.get_pair(pair_id_result)
         info(f"Connected {side} Joy-Con {mac} to Pair {pair_id_result + 1} (Mode: {pair.get_mode_display()})")
@@ -129,13 +274,11 @@ async def connect_joycon(device, side: str, mac: str, pair_id: Optional[int] = N
         
     except asyncio.TimeoutError:
         warning(f"Connection timeout for {mac} - device may not be in pairing mode")
+        await cleanup_failed_connection(client, side, mac, assigned_pair_id)
         return False
     except Exception as e:
         error(f"Error connecting to {mac}: {type(e).__name__}: {e}")
-        try:
-            await manager.remove_joycon(mac)
-        except:
-            pass
+        await cleanup_failed_connection(client, side, mac, assigned_pair_id)
         return False
 
 
@@ -149,15 +292,6 @@ async def handle_duo_joycons(client, side: str, pair_id: int, mac: str, orientat
         mac: MAC address
         orientation: 0=Vertical (default), 1=Horizontal
     """
-    # Only reset Joy-Con instances if this is the first Joy-Con in the pair
-    # (avoids clearing the first Joy-Con's state when connecting the second one)
-    from controller_manager import get_controller_manager
-    manager = get_controller_manager()
-    existing_pair = manager.get_pair(pair_id)
-    if existing_pair and not existing_pair.is_active():
-        from control_type.duo_joycon import reset_joycon_instances
-        reset_joycon_instances(pair_id)
-    
     from control_type.duo_joycon import notify_duo_joycons
     
     async def notification_handler(sender, data):
@@ -168,20 +302,21 @@ async def handle_duo_joycons(client, side: str, pair_id: int, mac: str, orientat
             # Directly await the notification handler
             await notify_duo_joycons(client, side, data, pair_id)
         except Exception as e:
-            # Silently ignore errors after disconnect
-            pass
+            log_notification_error(f"Duo notification pair={pair_id} side={side}", e)
     
     def response_handler(sender, data):
         try:
             if client.is_connected:
                 ControllerCommand().receive_response(client, data)
-        except:
-            pass
+        except Exception as e:
+            log_notification_error(f"Duo command response pair={pair_id} side={side}", e)
     
+    response_notify_started = False
     try:
         await client.start_notify(UUID_CMD_RESPONSE, response_handler)
+        response_notify_started = True
+        await capture_power_level(client, side, mac)
         await initSendControllerCmd(client, "Joy-Con", pair_id)
-        await client.stop_notify(UUID_CMD_RESPONSE)
         
         # Set controller orientation
         from controller_manager import get_controller_manager
@@ -192,16 +327,28 @@ async def handle_duo_joycons(client, side: str, pair_id: int, mac: str, orientat
                 pair.left.orientation = orientation
             elif side == "Right" and pair.right.is_connected:
                 pair.right.orientation = orientation
-    except Exception as e:
-        warning(f"Error with UUID_CMD_RESPONSE for {mac}: {e}")
-        info("Continuing without command response notifications...")
-        await initSendControllerCmd(client, "Joy-Con", pair_id)
+    finally:
+        if response_notify_started:
+            try:
+                await client.stop_notify(UUID_CMD_RESPONSE)
+            except Exception as e:
+                debug(f"Failed to stop command notifications for {mac}: {e}")
     
     await client.start_notify(UUID_NOTIFY, notification_handler)
 
 
 async def handle_single_joycon(client, side: str, orientation: int, pair_id: int, mac: str):
     """Handle single Joy-Con mode for a specific pair"""
+    # Persist the initial orientation in the shared pair state.  Subsequent
+    # GUI changes update this same value and are picked up per report.
+    manager = get_controller_manager()
+    pair = manager.get_pair(pair_id)
+    if pair:
+        if side == "Left":
+            pair.left.orientation = orientation
+        elif side == "Right":
+            pair.right.orientation = orientation
+
     # Reset pair state to clear old joycon instance
     from control_type.single_joycon import reset_pair_state
     reset_pair_state(pair_id)
@@ -216,24 +363,27 @@ async def handle_single_joycon(client, side: str, orientation: int, pair_id: int
             # Directly await the notification handler
             await notify_single_joycons(client, side, orientation, data, pair_id)
         except Exception as e:
-            # Silently ignore errors after disconnect
-            pass
+            log_notification_error(f"Single notification pair={pair_id} side={side}", e)
     
     def response_handler(sender, data):
         try:
             if client.is_connected:
                 ControllerCommand().receive_response(client, data)
-        except:
-            pass
+        except Exception as e:
+            log_notification_error(f"Single command response pair={pair_id} side={side}", e)
     
+    response_notify_started = False
     try:
         await client.start_notify(UUID_CMD_RESPONSE, response_handler)
+        response_notify_started = True
+        await capture_power_level(client, side, mac)
         await initSendControllerCmd(client, "Joy-Con", pair_id)
-        await client.stop_notify(UUID_CMD_RESPONSE)
-    except Exception as e:
-        warning(f"Error with UUID_CMD_RESPONSE for {mac}: {e}")
-        info("Continuing without command response notifications...")
-        await initSendControllerCmd(client, "Joy-Con", pair_id)
+    finally:
+        if response_notify_started:
+            try:
+                await client.stop_notify(UUID_CMD_RESPONSE)
+            except Exception as e:
+                debug(f"Failed to stop command notifications for {mac}: {e}")
     
     await client.start_notify(UUID_NOTIFY, notification_handler)
 
@@ -241,33 +391,70 @@ async def handle_single_joycon(client, side: str, orientation: int, pair_id: int
 async def initSendControllerCmd(client, controllerName: str, pair_id: int):
     """Send initialization commands to controller"""
     controllerCommand = ControllerCommand()
+    current_config = Config().getConfig()
+
+    async def send_required(command_type, args=None):
+        if not await controllerCommand.send_command(client, command_type, args):
+            raise RuntimeError(f"Controller command failed: {command_type}")
     
-    if config.get('save_mac_address', False):
-        mac_address = config.get('mac_address', b'\xFF' * 6)
+    if current_config.get('save_mac_address', False):
+        mac_address = current_config.get('mac_address', b'\xFF' * 6)
         mac_addr1 = mac_address
-        mac_addr2 = (mac_address[0] - 1).to_bytes(1, 'big') + mac_address[1:]
+        mac_addr2 = ((mac_address[0] - 1) & 0xFF).to_bytes(1, 'big') + mac_address[1:]
         
-        await controllerCommand.send_command(client, "JOY2_SAVE_MC_ADDR_STEP1", 
-                                            {"mac-addr1": mac_addr1.hex(), "mac-addr2": mac_addr2.hex()})
-        await controllerCommand.send_command(client, "JOY2_SAVE_MC_ADDR_STEP2")
-        await controllerCommand.send_command(client, "JOY2_SAVE_MC_ADDR_STEP3")
-        await controllerCommand.send_command(client, "JOY2_SAVE_MC_ADDR_STEP4")
+        await send_required("JOY2_SAVE_MC_ADDR_STEP1",
+                            {"mac-addr1": mac_addr1.hex(), "mac-addr2": mac_addr2.hex()})
+        await send_required("JOY2_SAVE_MC_ADDR_STEP2")
+        await send_required("JOY2_SAVE_MC_ADDR_STEP3")
+        await send_required("JOY2_SAVE_MC_ADDR_STEP4")
         info(f"MAC address saved successfully.")
     
-    await controllerCommand.send_command(client, "JOY2_CONNECTED_VIBRATION")
+    await send_required("JOY2_CONNECTED_VIBRATION")
     
     # Set LED to show pair number (1-4)
-    led_value = format(pair_id + 1, 'x')  # 1, 2, 4, 8 for players 1-4
-    await controllerCommand.send_command(client, "JOY2_SET_PLAYER_LED", {"led_player": led_value})
-    
-    await controllerCommand.send_command(client, "JOY2_INIT_SENSOR_DATA")
-    await controllerCommand.send_command(client, "JOY2_START_SENSOR_DATA")
+    led_value = get_player_led_value(pair_id)
+    await send_required("JOY2_SET_PLAYER_LED", {"led_player": led_value})
+
+    await send_required("JOY2_INIT_SENSOR_DATA")
+    await send_required("JOY2_START_SENSOR_DATA")
+
+    # Query battery through the command-response channel. This is reliable on
+    # hardware where report 0x07/0x08 is notify-only, and unlike subscribing to
+    # that alternate report it does not interrupt the main button/IMU stream.
+    if await controllerCommand.send_command(client, "JOY2_GET_BATTERY_VOLTAGE"):
+        response = controllerCommand.lastResponse
+        if response and len(response) >= 10:
+            voltage_mv = int.from_bytes(response[8:10], "little")
+            battery_level = battery_percentage_from_voltage(voltage_mv)
+            if battery_level is not None:
+                mac = client.address.replace(":", "").replace("-", "").upper()
+                manager = get_controller_manager()
+                pair = manager.get_pair_by_mac(mac)
+                joycon_info = None
+                if pair:
+                    if pair.left.mac_address == mac:
+                        joycon_info = pair.left
+                    elif pair.right.mac_address == mac:
+                        joycon_info = pair.right
+                # The native 0-9 state-of-charge report is authoritative.
+                # Only use voltage estimation when that report was unavailable.
+                if joycon_info is None or joycon_info.battery_level is None:
+                    manager.update_battery(mac, battery_level)
+                    info(f"Joy-Con 2 battery fallback: {voltage_mv} mV (~{battery_level}%)")
+                else:
+                    info(f"Joy-Con 2 battery voltage: {voltage_mv} mV")
+            else:
+                warning(f"Ignoring invalid Joy-Con 2 battery voltage: {voltage_mv} mV")
 
     # Request high-throughput BLE connection parameters on Windows 11 (build >= 22000)
     # to increase sensor data frequency. Copied from switch2_input_viewer.py by ndeadly.
     if platform.system() == 'Windows':
         version = platform.version()
-        build_number = int(version.split('.')[-1])
+        try:
+            build_number = int(version.rsplit('.', 1)[-1])
+        except (TypeError, ValueError):
+            warning(f"Unable to determine Windows build from {version!r}; skipping BLE throughput tuning")
+            return
         if build_number >= 22000:
             from bleak.backends.winrt.client import BleakClientWinRT
             from winrt.windows.devices.bluetooth import BluetoothLEPreferredConnectionParameters
@@ -281,18 +468,32 @@ async def disconnect_all():
     global _connected_devices
     
     info("Disconnecting all controllers...")
+    manager = get_controller_manager()
     for mac, (client, side, pair_id) in list(_connected_devices.items()):
         try:
             if client.is_connected:
+                try:
+                    await client.stop_notify(get_power_report_uuid(side))
+                except:
+                    pass
                 await client.disconnect()
-                info(f"Disconnected {mac}")
+            info(f"Disconnected {mac}")
         except Exception as e:
             error(f"Error disconnecting {mac}: {e}")
+        await manager.remove_joycon(mac)
+        pair = manager.get_pair(pair_id)
+        try:
+            from control_type.duo_joycon import cleanup_disconnected_joycon, unregister_vibration
+            unregister_vibration(side, pair_id)
+            cleanup_disconnected_joycon(pair_id, side, pair is None or not pair.is_active())
+            from control_type.single_joycon import reset_pair_state
+            reset_pair_state(pair_id)
+        except Exception as exc:
+            debug(f"State cleanup failed for pair {pair_id}: {exc}")
     
     _connected_devices.clear()
     
-    # Clear controller manager
-    manager = get_controller_manager()
+    # Clear any assignments that were not present in the connection registry.
     for mac in list(manager._mac_to_pair.keys()):
         await manager.remove_joycon(mac)
 
@@ -398,6 +599,9 @@ async def disconnect_pair_by_id(pair_id: int):
     if not pair:
         return
 
+    from control_type.duo_joycon import cleanup_disconnected_joycon, unregister_vibration
+    from control_type.single_joycon import reset_pair_state
+
     # Disconnect left
     if pair.left and pair.left.mac_address:
         mac = pair.left.mac_address
@@ -414,11 +618,18 @@ async def disconnect_pair_by_id(pair_id: int):
                         await client.stop_notify(UUID_CMD_RESPONSE)
                     except:
                         pass
+                    try:
+                        await client.stop_notify(get_power_report_uuid("Left"))
+                    except:
+                        pass
                     await client.disconnect()
             except:
                 pass
-            del _connected_devices[mac]
+            _connected_devices.pop(mac, None)
         await manager.remove_joycon(mac)
+        cleanup_disconnected_joycon(pair_id, "Left", not pair.is_active())
+        reset_pair_state(pair_id)
+        unregister_vibration("Left", pair_id)
 
     # Disconnect right
     if pair.right and pair.right.mac_address:
@@ -436,16 +647,19 @@ async def disconnect_pair_by_id(pair_id: int):
                         await client.stop_notify(UUID_CMD_RESPONSE)
                     except:
                         pass
+                    try:
+                        await client.stop_notify(get_power_report_uuid("Right"))
+                    except:
+                        pass
                     await client.disconnect()
             except:
                 pass
-            del _connected_devices[mac]
+            _connected_devices.pop(mac, None)
         await manager.remove_joycon(mac)
+        cleanup_disconnected_joycon(pair_id, "Right", not pair.is_active())
+        reset_pair_state(pair_id)
+        unregister_vibration("Right", pair_id)
 
-    # Clean up vibration client references for this pair
-    from control_type.duo_joycon import unregister_vibration
-    unregister_vibration("Left", pair_id)
-    unregister_vibration("Right", pair_id)
 
 
 async def main():
@@ -459,7 +673,7 @@ async def main():
 
     try:
         # Start DSU server if enabled
-        if config.get('enable_dsu', False):
+        if Config().enable_dsu:
             main_dsu()
 
         # Keep running until interrupted

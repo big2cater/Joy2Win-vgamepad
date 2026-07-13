@@ -78,7 +78,9 @@ class Config:
         if "Bluetooth" in config_parser or "bluetooth" in config_parser:
             section = config_parser["Bluetooth"] if "Bluetooth" in config_parser else config_parser["bluetooth"]
             configMacAddress = section.get("mac_address", self.mac_address)
-            if(configMacAddress and len(configMacAddress) == 12 and all(c in "0123456789ABCDEF" for c in configMacAddress.upper())): # Valid MAC address format like AABBCCDDEEFF
+            if not configMacAddress:
+                self.mac_address = self._defaults["mac_address"]
+            elif(len(configMacAddress) == 12 and all(c in "0123456789ABCDEF" for c in configMacAddress.upper())): # Valid MAC address format like AABBCCDDEEFF
                 self.mac_address = bytes.fromhex(configMacAddress)[::-1] # Convert mac to little-endian format
             else:
                 print(f"Invalid MAC address in {self._config_path}. Using default: {self.mac_address}")

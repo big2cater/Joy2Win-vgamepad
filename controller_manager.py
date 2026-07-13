@@ -26,7 +26,9 @@ class JoyConInfo:
     client: object = None
     side: str = ""  # "Left" or "Right"
     mac_address: str = ""
-    battery_level: int = 100
+    battery_level: Optional[int] = None
+    is_charging: bool = False
+    external_power: bool = False
     is_connected: bool = False
     last_seen: float = 0
     orientation: int = 0  # 0=Vertical, 1=Horizontal
@@ -75,6 +77,11 @@ class ControllerManager:
     """Manager for multiple Joy-Con pairs"""
     
     MAX_PAIRS = 4  # Maximum 4 pairs (8 Joy-Cons)
+
+    @staticmethod
+    def _normalize_mac(mac_address: str) -> str:
+        """Normalize colon, dash, and compact Bluetooth address formats."""
+        return (mac_address or "").replace(":", "").replace("-", "").upper()
     
     def __init__(self):
         self.pairs: Dict[int, ControllerPair] = {}
@@ -82,13 +89,18 @@ class ControllerManager:
         self._callbacks: List[Callable] = []
         self._lock = asyncio.Lock()
         
-        # Initialize pairs
+        # Pair records are cheap.  Creating VX360Gamepad is not: each instance
+        # appears to Windows as a real controller, so create it only on use.
         for i in range(self.MAX_PAIRS):
             self.pairs[i] = ControllerPair(
                 pair_id=i,
-                gamepad=vgamepad.VX360Gamepad(),
                 led_player=i + 1
             )
+
+    @staticmethod
+    def _ensure_gamepad(pair: ControllerPair):
+        if pair.gamepad is None:
+            pair.gamepad = vgamepad.VX360Gamepad()
     
     def register_callback(self, callback: Callable):
         """Register a callback for controller status changes"""
@@ -118,6 +130,7 @@ class ControllerManager:
         Returns:
             The pair_id if successful, None otherwise
         """
+        mac_address = self._normalize_mac(mac_address)
         async with self._lock:
             # Check if this MAC is already assigned
             if mac_address in self._mac_to_pair:
@@ -137,6 +150,7 @@ class ControllerManager:
                     pair.right.last_seen = time.time()
                 
                 pair.update_mode()
+                self._ensure_gamepad(pair)
                 self._notify_callbacks()
                 return pair_id
             
@@ -152,6 +166,7 @@ class ControllerManager:
                     pair.left.last_seen = time.time()
                     self._mac_to_pair[mac_address] = preferred_pair
                     pair.update_mode()
+                    self._ensure_gamepad(pair)
                     self._notify_callbacks()
                     return preferred_pair
                 elif side == "Right" and not pair.right.is_connected:
@@ -161,6 +176,7 @@ class ControllerManager:
                     pair.right.last_seen = time.time()
                     self._mac_to_pair[mac_address] = preferred_pair
                     pair.update_mode()
+                    self._ensure_gamepad(pair)
                     self._notify_callbacks()
                     return preferred_pair
             
@@ -174,6 +190,7 @@ class ControllerManager:
                     pair.left.last_seen = time.time()
                     self._mac_to_pair[mac_address] = pair_id
                     pair.update_mode()
+                    self._ensure_gamepad(pair)
                     self._notify_callbacks()
                     return pair_id
                 elif side == "Right" and not pair.right.is_connected:
@@ -183,6 +200,7 @@ class ControllerManager:
                     pair.right.last_seen = time.time()
                     self._mac_to_pair[mac_address] = pair_id
                     pair.update_mode()
+                    self._ensure_gamepad(pair)
                     self._notify_callbacks()
                     return pair_id
             
@@ -192,6 +210,7 @@ class ControllerManager:
     
     async def remove_joycon(self, mac_address: str):
         """Remove a Joy-Con from its pair"""
+        mac_address = self._normalize_mac(mac_address)
         async with self._lock:
             if mac_address not in self._mac_to_pair:
                 return
@@ -205,15 +224,31 @@ class ControllerManager:
                 pair.left.is_connected = False
                 pair.left.client = None
                 pair.left.mac_address = ""
+                pair.left.battery_level = None
+                pair.left.is_charging = False
+                pair.left.external_power = False
             elif pair.right.mac_address == mac_address:
                 # Clear the right joycon connection state
                 pair.right.is_connected = False
                 pair.right.client = None
                 pair.right.mac_address = ""
+                pair.right.battery_level = None
+                pair.right.is_charging = False
+                pair.right.external_power = False
             
+            # A disconnected controller must not retain an old-pair mapping;
+            # otherwise a later GUI-selected reconnect is silently ignored.
+            del self._mac_to_pair[mac_address]
+
             # Check if pair is now empty
             if not pair.is_active():
-                del self._mac_to_pair[mac_address]
+                if pair.gamepad is not None:
+                    try:
+                        pair.gamepad.reset()
+                        pair.gamepad.update()
+                    except Exception:
+                        pass
+                    pair.gamepad = None
             
             pair.update_mode()
             self._notify_callbacks()
@@ -224,6 +259,7 @@ class ControllerManager:
     
     def get_pair_by_mac(self, mac_address: str) -> Optional[ControllerPair]:
         """Get a controller pair by MAC address"""
+        mac_address = self._normalize_mac(mac_address)
         if mac_address in self._mac_to_pair:
             return self.pairs[self._mac_to_pair[mac_address]]
         return None
@@ -236,18 +272,30 @@ class ControllerManager:
         """Get number of connected pairs"""
         return len(self.get_active_pairs())
     
-    def update_battery(self, mac_address: str, battery_level: int):
+    def update_battery(self, mac_address: str, battery_level: int,
+                       is_charging: bool = False, external_power: bool = False):
         """Update battery level for a Joy-Con"""
+        mac_address = self._normalize_mac(mac_address)
         if mac_address in self._mac_to_pair:
             pair_id = self._mac_to_pair[mac_address]
             pair = self.pairs[pair_id]
-            
+            joycon = None
             if pair.left.mac_address == mac_address:
-                pair.left.battery_level = battery_level
+                joycon = pair.left
             elif pair.right.mac_address == mac_address:
-                pair.right.battery_level = battery_level
-            
-            self._notify_callbacks()
+                joycon = pair.right
+
+            if joycon is not None:
+                changed = (
+                    joycon.battery_level != battery_level
+                    or joycon.is_charging != is_charging
+                    or joycon.external_power != external_power
+                )
+                joycon.battery_level = battery_level
+                joycon.is_charging = is_charging
+                joycon.external_power = external_power
+                if changed:
+                    self._notify_callbacks()
     
     def get_gamepad(self, pair_id: int) -> Optional[vgamepad.VX360Gamepad]:
         """Get the virtual gamepad for a pair"""

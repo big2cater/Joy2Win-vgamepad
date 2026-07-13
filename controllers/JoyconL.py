@@ -58,14 +58,16 @@ class JoyConLeft:
 
         self.timestamp = bytes.fromhex("00000000") 
         self.motionTimestamp = bytes.fromhex("00000000")
-        self.battery_level = 100.0
+        # Battery is queried through the dedicated command-response channel.
+        self.battery_level = None
         self.alertSent = False
         self.is_connected = False
 
     async def update(self, datas):
-        # Update button states based on the received data
-        if len(datas) < 0x3C:
-            print(f"[WARNING] Data too short: {len(datas)} bytes (expected at least {0x3C})")
+        # Button/stick/mouse fields end at byte 23.  IMU fields are optional
+        # and only occupy the final 12 bytes of the 60-byte report.
+        if len(datas) < 24:
+            print(f"[WARNING] Data too short: {len(datas)} bytes (expected at least 24)")
             return
         
         btnDatas = datas[5] << 8 | datas[6]
@@ -77,21 +79,21 @@ class JoyConLeft:
 
         self.timestamp = bytes.fromhex(datas[0:4].hex())
 
-        self.motionTimestamp = struct.unpack("<i", datas[0x2A:0x2E])[0]
+        if len(datas) >= 0x3C:
+            self.motionTimestamp = struct.unpack("<i", datas[0x2A:0x2E])[0]
+            accel_x_raw, accel_y_raw, accel_z_raw = struct.unpack("<3h", datas[0x30:0x36])
+            gyro_x_raw, gyro_y_raw, gyro_z_raw = struct.unpack("<3h", datas[0x36:0x3C])
 
-        accel_x_raw, accel_y_raw, accel_z_raw = struct.unpack("<3h", datas[0x30:0x36])
-        gyro_x_raw, gyro_y_raw, gyro_z_raw = struct.unpack("<3h", datas[0x36:0x3C])
+            accel_factor = 1 / 4096  # 1G = 4096
+            gyro_factor = 360 / 6048  # 360° = 6048
 
-        accel_factor = 1 / 4096  # 1G = 4096
-        gyro_factor = 360 / 6048  # 360° = 6048
+            self.accelerometer["X"] = -accel_x_raw * accel_factor
+            self.accelerometer["Y"] = -accel_z_raw * accel_factor
+            self.accelerometer["Z"] = accel_y_raw * accel_factor
 
-        self.accelerometer["X"] = -accel_x_raw * accel_factor
-        self.accelerometer["Y"] = -accel_z_raw * accel_factor
-        self.accelerometer["Z"] = accel_y_raw * accel_factor
-
-        self.gyroscope["X"] = gyro_x_raw * gyro_factor
-        self.gyroscope["Y"] = -gyro_z_raw * gyro_factor
-        self.gyroscope["Z"] = gyro_y_raw * gyro_factor
+            self.gyroscope["X"] = gyro_x_raw * gyro_factor
+            self.gyroscope["Y"] = -gyro_z_raw * gyro_factor
+            self.gyroscope["Z"] = gyro_y_raw * gyro_factor
 
         #print(f"Timestamp: {self.timestamp.hex()}, Accel: ({self.accelerometer['X']}, {self.accelerometer['Y']}, {self.accelerometer['Z']}), Gyro: ({self.gyroscope['X']}, {self.gyroscope['Y']}, {self.gyroscope['Z']})")
 
@@ -112,14 +114,6 @@ class JoyConLeft:
         self.mouseBtn["Left"] = bool(btnDatas & 0x0040) #L
         self.mouseBtn["Right"] = bool(btnDatas & 0x0080) #ZL
         self.mouseBtn["scrollX"], self.mouseBtn["scrollY"] = scroll_decoder(JoystickDatas)
-
-        # Update battery level only if the new value is lower than the current one
-        battery_raw = (datas[31]) | (datas[32] << 8)
-        self.battery_level = round(battery_raw * 100 / 4095)
-
-        if(self.battery_level < 10.0 and self.is_connected and not self.alertSent):
-            self.notify_low_battery()
-            self.alertSent = True
 
         self.is_connected = True
 
