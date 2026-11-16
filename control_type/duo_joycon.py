@@ -2,10 +2,15 @@ from controllers.JoyconL import JoyConLeft
 from controllers.JoyconR import JoyConRight
 
 from dsu_server import controller_update
-from controller_command import ControllerCommand, UUID_CMD
+from control_type.mouse_scroll import (
+    mouse_divisor as _mouse_divisor,
+    scroll_notches,
+    surface_threshold as _surface_threshold,
+)
+from control_type.rumble_stream import get_rumble_stream
 
 from config import Config
-from pynput.mouse import Controller, Button
+from control_type.virtual_mouse import BTN_LEFT, BTN_RIGHT, get_mouse_output
 from logger_config import info, warning, error, debug
 
 import vgamepad
@@ -174,54 +179,56 @@ def set_vibration_enabled(enabled, pair_id: int = 0):
     _pair_vibration_enabled[pair_id] = enabled
 
 # Vibration callback function
-async def send_vibration_to_client(client, large_motor, small_motor):
-    """Send vibration command to a specific Joy-Con client"""
-    try:
-        if not client.is_connected:
-            warning(f"[VIBRATION] client not connected, skipping vibration")
-            return
+async def send_vibration_to_client(pair_id, side, client, large_motor, small_motor):
+    """Feed one XInput rumble update into this Joy-Con's HD Rumble stream.
 
-        left_intensity = min(255, max(0, large_motor))
-        right_intensity = min(255, max(0, small_motor))
+    The old code wrote a single fixed stored effect (sample 0x01, a ~1 s
+    buzz) to the command characteristic, merged both motors into one value,
+    and used an invalid stop frame. Both motor channels are now preserved and
+    the stream owns cadence, stopping and the amplitude cap.
+    """
+    if not getattr(client, "is_connected", False):
+        return
+    await get_rumble_stream().update(
+        pair_id, side, client, large_motor, small_motor
+    )
 
-        DEADZONE = 5
-        if left_intensity < DEADZONE:
-            left_intensity = 0
-        if right_intensity < DEADZONE:
-            right_intensity = 0
-
-        if left_intensity == 0 and right_intensity == 0:
-            vibration_data = bytes.fromhex("0a000000000000000000000000")
-        else:
-            vibration_data = bytes.fromhex("0A9101020004000001000000")
-
-        await client.write_gatt_char(UUID_CMD, vibration_data)
-    except Exception as e:
-        error(f"[VIBRATION] write_gatt_char failed: {type(e).__name__}: {e}")
 
 async def send_vibration(pair_id, large_motor, small_motor):
-    """Send vibration to all connected Joy-Con clients for a specific pair"""
-    tasks = []
-    combined_intensity = max(large_motor, small_motor)
-
+    """Two XInput motor channels -> independent HD Rumble streams per side."""
     pair_clients = vibration_clients.get(pair_id, {})
-    for side in ['Left', 'Right']:
+    tasks = []
+    for side in ('Left', 'Right'):
         client = pair_clients.get(side)
         if client:
-            info(f"[VIBRATION] pair={pair_id} side={side} client_connected={client.is_connected} intensity={combined_intensity}")
-            tasks.append(send_vibration_to_client(client, combined_intensity, combined_intensity))
-        else:
-            info(f"[VIBRATION] pair={pair_id} side={side} NO CLIENT REGISTERED")
-
+            tasks.append(
+                send_vibration_to_client(
+                    pair_id, side, client, large_motor, small_motor
+                )
+            )
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 def vibration_callback(pair_id, client, target, large_motor, small_motor, led_number, user_data):
-    """Callback for gamepad vibration feedback from vgamepad"""
+    """Callback for gamepad vibration feedback from vgamepad.
+
+    Runs on vgamepad's thread. If a stream is already sending for this side,
+    update its targets in place -- no event-loop hop. Only creating or
+    restarting a stream needs the loop, and doing that on every callback
+    starved the 12 ms sender (cadence fell to ~12 fps while writes took 0.7 ms).
+    """
     if not _pair_vibration_enabled.get(pair_id, True):
         return
 
     global _event_loop
+    stream = get_rumble_stream()
+    clients = vibration_clients.get(pair_id, {})
+    if clients and all(
+        stream.update_sync(pair_id, side, c, large_motor, small_motor)
+        for side, c in list(clients.items())
+    ):
+        return
+
     if _event_loop is not None:
         try:
             asyncio.run_coroutine_threadsafe(send_vibration(pair_id, large_motor, small_motor), _event_loop)
@@ -267,6 +274,11 @@ def register_vibration(client, side, pair_id: int = 0):
 
 def unregister_vibration(side: str, pair_id: int = 0):
     """Remove a client from vibration tracking (called on disconnect)."""
+    try:
+        get_rumble_stream().stop_sync(pair_id, side)
+    except Exception as exc:
+        debug(f"[RUMBLE] stop on unregister failed: {exc}")
+
     if pair_id in vibration_clients and side in vibration_clients[pair_id]:
         del vibration_clients[pair_id][side]
         info(f"[VIBRATION] unregistered side={side} from pair_id={pair_id}")
@@ -295,9 +307,35 @@ _pair_state_lock = threading.RLock()
 _mouse_loop_thread = None
 _mouse_loop_start_lock = threading.Lock()
 _mouse_wakeup = threading.Event()
+_mouse_stop = threading.Event()
 
-# Per-pair mouse enabled state (set from GUI)
+# Per-pair mouse mode override (set from the GUI checkbox). Unset pairs follow
+# config.ini's mouse_mode, which config.py has always parsed but nothing ever
+# read: 0 disabled, 1 automatic (lift off the surface to switch), 2 always on.
 pair_mouse_enabled = {}
+_pair_mouse_mode = {}
+
+# Per-pair DSU motion streaming. Unset pairs fall back to the global config
+# flag so existing installs keep working without touching config.ini.
+_pair_dsu_enabled = {}
+
+# Xbox signed axis units (-32768..32767). The old value of 3000 swallowed
+# roughly 9% of the stick range; with a learned centre the residual noise
+# only needs a light guard.
+STICK_DEADZONE = 1200
+
+# Report 0x05 offset 0x16: ~117-158 on a desk, ~3083-3321 when lifted.
+SURFACE_DISTANCE_MAX = 512
+
+
+def set_dsu_enabled(pair_id: int, enabled: bool):
+    _pair_dsu_enabled[pair_id] = bool(enabled)
+
+
+def is_dsu_enabled(pair_id: int) -> bool:
+    if pair_id in _pair_dsu_enabled:
+        return _pair_dsu_enabled[pair_id]
+    return bool(Config().enable_dsu)
 
 
 def get_pair_state(pair_id: int):
@@ -317,27 +355,49 @@ def get_pair_state(pair_id: int):
         return pair_state[pair_id]
 
 
+def _config_mouse_mode() -> int:
+    try:
+        mode = int(Config().mouse_mode)
+    except Exception:
+        return 0
+    return mode if mode in (0, 1, 2) else 0
+
+
+def mouse_mode(pair_id: int) -> int:
+    """Effective mode: the GUI override if present, else config.ini."""
+    return _pair_mouse_mode.get(pair_id, _config_mouse_mode())
+
+
 def set_mouse_enabled(pair_id: int, enabled: bool):
-    """Set mouse control enabled for a specific pair (called from GUI)"""
+    """GUI checkbox. Ticking it means automatic switching, not "always on"."""
+    _pair_mouse_mode[pair_id] = 1 if enabled else 0
     pair_mouse_enabled[pair_id] = enabled
 
 
 def is_mouse_enabled(pair_id: int) -> bool:
     """Check if mouse control is enabled for a specific pair"""
-    return pair_mouse_enabled.get(pair_id, False)
+    return mouse_mode(pair_id) != 0
+
+
+def is_mouse_always(pair_id: int) -> bool:
+    """Mouse mode on regardless of the surface-distance sensor."""
+    return mouse_mode(pair_id) == 2
 
 
 def mouse_loop():
-    """Global mouse loop - handles all pairs"""
-    while True:
+    """Global mouse loop - handles all pairs until stop_mouse_loop()."""
+    while not _mouse_stop.is_set():
+        # Read once per tick: Config() is a singleton, so this is an attribute
+        # access, and it lets a config change take effect without a restart.
+        divisor = _mouse_divisor()
         movements = []
         with _pair_state_lock:
             for state in pair_state.values():
                 # Truncate towards zero and always consume a non-zero remainder.
                 # ``//`` made tiny positive moves disappear and biased negative
                 # moves, which made pointer control feel delayed and uneven.
-                stepX = int(state['targetX'] / 6)
-                stepY = int(state['targetY'] / 6)
+                stepX = int(state['targetX'] / divisor)
+                stepY = int(state['targetY'] / divisor)
                 if stepX == 0 and state['targetX']:
                     stepX = 1 if state['targetX'] > 0 else -1
                 if stepY == 0 and state['targetY']:
@@ -351,14 +411,27 @@ def mouse_loop():
         # pynput can block; do not hold the state lock while calling it.
         if movements:
             for stepX, stepY in movements:
-                mouse.move(stepX, stepY)
+                get_mouse_output().move(stepX, stepY)
             time.sleep(0.006)
         else:
-            _mouse_wakeup.wait()
+            # Timeout lets the loop notice stop_mouse_loop() while idle.
+            _mouse_wakeup.wait(timeout=0.2)
             _mouse_wakeup.clear()
 
 
-mouse = Controller()
+def stop_mouse_loop():
+    """Signal the global mouse loop to exit and wait for its thread."""
+    global _mouse_loop_thread
+    _mouse_stop.set()
+    _mouse_wakeup.set()
+    with _mouse_loop_start_lock:
+        thread = _mouse_loop_thread
+        _mouse_loop_thread = None
+    if (thread is not None and thread.is_alive()
+            and thread is not threading.current_thread()):
+        thread.join(timeout=2.0)
+
+
 
 
 def cleanup_disconnected_joycon(pair_id: int, side: str, pair_empty: bool = False):
@@ -372,9 +445,9 @@ def cleanup_disconnected_joycon(pair_id: int, side: str, pair_empty: bool = Fals
         state = pair_state.get(pair_id)
         if state is not None:
             if state['leftPressed']:
-                mouse.release(Button.left)
+                get_mouse_output().button(BTN_LEFT, False)
             if state['rightPressed']:
-                mouse.release(Button.right)
+                get_mouse_output().button(BTN_RIGHT, False)
             state['leftPressed'] = False
             state['rightPressed'] = False
             state['targetX'] = 0
@@ -388,7 +461,7 @@ def cleanup_disconnected_joycon(pair_id: int, side: str, pair_empty: bool = Fals
         _pair_update_locks.pop(pair_id, None)
 
 
-async def update(pair_id: int = 0):
+async def update(pair_id: int = 0, updated_side: str = None):
     # Serialize per-pair updates so Left and Right notifications don't
     # interleave gamepad writes across an await boundary.
     async with _get_pair_update_lock(pair_id):
@@ -410,15 +483,39 @@ async def update(pair_id: int = 0):
         # Check if mouse control is enabled for this pair
         mouse_enabled = is_mouse_enabled(pair_id)
 
-        # Check mouse mode from both Joy-Cons
-        isMouseModeLeft = joyconLeft.mouse["distance"] == "00" or joyconLeft.mouse["distance"] == "01"
-        isMouseModeRight = joyconRight.mouse["distance"] == "00" or joyconRight.mouse["distance"] == "01"
+        # Check mouse mode from both Joy-Cons. Mode 2 ("always") skips the
+        # distance sensor entirely; with both halves lying flat the left one
+        # wins, matching the automatic path's preference.
+        always_on = is_mouse_always(pair_id)
+        threshold = _surface_threshold()
+        isMouseModeLeft = always_on or (
+            joyconLeft.mouse.get("distance_raw", 0xFFFF) < threshold
+        )
+        isMouseModeRight = always_on or (
+            joyconRight.mouse.get("distance_raw", 0xFFFF) < threshold
+        )
         
         previous_mouse_mode = state['joyconMouseMode']
-        if mouse_enabled and state['joyconMouseMode'] is None and (isMouseModeLeft or isMouseModeRight):
-            state['joyconMouseMode'] = "Left" if isMouseModeLeft else "Right"
-        elif not mouse_enabled or (not isMouseModeLeft and not isMouseModeRight):
+        if not mouse_enabled:
             state['joyconMouseMode'] = None
+        else:
+            current = state['joyconMouseMode']
+            # Keep whichever side is actually on a surface, otherwise switch to
+            # the one that just landed, otherwise give up the mode.
+            #
+            # The previous two-branch form pinned the mode to "Left" whenever the
+            # left half lifted while the right one was being used (neither branch
+            # matched), so pointer input froze on a Joy-Con that was in the air.
+            if current == "Left" and isMouseModeLeft:
+                pass
+            elif current == "Right" and isMouseModeRight:
+                pass
+            elif isMouseModeLeft:
+                state['joyconMouseMode'] = "Left"
+            elif isMouseModeRight:
+                state['joyconMouseMode'] = "Right"
+            else:
+                state['joyconMouseMode'] = None
 
         if previous_mouse_mode != state['joyconMouseMode']:
             current_joycon = joyconLeft if state['joyconMouseMode'] == "Left" else joyconRight
@@ -429,9 +526,9 @@ async def update(pair_id: int = 0):
                 state['targetY'] = 0
             if state['joyconMouseMode'] is None:
                 if state['leftPressed']:
-                    mouse.release(Button.left)
+                    get_mouse_output().button(BTN_LEFT, False)
                 if state['rightPressed']:
-                    mouse.release(Button.right)
+                    get_mouse_output().button(BTN_RIGHT, False)
                 state['leftPressed'] = False
                 state['rightPressed'] = False
 
@@ -439,6 +536,8 @@ async def update(pair_id: int = 0):
         if mouse_enabled and state['joyconMouseMode'] is not None:
             with _mouse_loop_start_lock:
                 if _mouse_loop_thread is None or not _mouse_loop_thread.is_alive():
+                    # Re-arm in case a previous shutdown set the stop flag.
+                    _mouse_stop.clear()
                     _mouse_loop_thread = threading.Thread(target=mouse_loop, daemon=True)
                     _mouse_loop_thread.start()
 
@@ -496,18 +595,15 @@ async def update(pair_id: int = 0):
             # Clamp values to valid range
             left_x = max(-32768, min(32767, left_x))
             left_y = max(-32768, min(32767, left_y))
-            # Apply deadzone to prevent drift (consistent with single_joycon)
-            DEADZONE = 3000
+            # Light guard only; the learned centre removes the need for a
+            # large deadzone that used to eat fine stick movement.
+            DEADZONE = STICK_DEADZONE
             if abs(left_x) < DEADZONE:
                 left_x = 0
             if abs(left_y) < DEADZONE:
                 left_y = 0
             gamepad.left_joystick(left_x, left_y)
             
-            # Debug: Print left stick values
-            if Config().enable_dsu:
-                await controller_update(joyconLeft.motionTimestamp, joyconLeft.accelerometer, joyconLeft.gyroscope, slot=pair_id * 2)
-
         if state['joyconMouseMode'] != "Right":
             # Convert 0-32767 (Joy-Con format) to -32768-32767 (Xbox format)
             right_x_raw = min(joyconRight.analog_stick["X"], 32767)
@@ -516,18 +612,35 @@ async def update(pair_id: int = 0):
             right_y = int((right_y_raw - 16384) * 2)
             right_x = max(-32768, min(32767, right_x))
             right_y = max(-32768, min(32767, right_y))
-            # Apply deadzone to prevent drift (consistent with single_joycon)
-            DEADZONE = 3000
+            # Light guard only; the learned centre removes the need for a
+            # large deadzone that used to eat fine stick movement.
+            DEADZONE = STICK_DEADZONE
             if abs(right_x) < DEADZONE:
                 right_x = 0
             if abs(right_y) < DEADZONE:
                 right_y = 0
             gamepad.right_joystick(right_x, right_y)
 
-            if Config().enable_dsu:
-                await controller_update(joyconRight.motionTimestamp, joyconRight.accelerometer, joyconRight.gyroscope, slot=pair_id * 2 + 1)
-
         gamepad.update()
+
+        # Motion must stream on every report regardless of mouse mode or which
+        # stick branch ran. Previously entering mouse mode silently froze the
+        # DSU timestamp and emulators saw a dead gyro.
+        if is_dsu_enabled(pair_id):
+            if updated_side != "Right":
+                await controller_update(
+                    joyconLeft.motionTimestamp,
+                    joyconLeft.accelerometer,
+                    joyconLeft.gyroscope,
+                    slot=pair_id * 2,
+                )
+            if updated_side != "Left":
+                await controller_update(
+                    joyconRight.motionTimestamp,
+                    joyconRight.accelerometer,
+                    joyconRight.gyroscope,
+                    slot=pair_id * 2 + 1,
+                )
 
         # Handle mouse movement based on which Joy-Con is in mouse mode
         if state['joyconMouseMode'] == "Left":
@@ -552,26 +665,31 @@ async def update(pair_id: int = 0):
 
             if joycon.mouseBtn["Left"] == True:
                 if not state['leftPressed']:
-                    mouse.press(Button.left)
+                    get_mouse_output().button(BTN_LEFT, True)
                 state['leftPressed'] = True
             else:
                 if state['leftPressed']:
-                    mouse.release(Button.left)
+                    get_mouse_output().button(BTN_LEFT, False)
                 state['leftPressed'] = False
 
             if joycon.mouseBtn["Right"] == True:
                 if not state['rightPressed']:
-                    mouse.press(Button.right)
+                    get_mouse_output().button(BTN_RIGHT, True)
                 state['rightPressed'] = True
             else:
                 if state['rightPressed']:
-                    mouse.release(Button.right)
+                    get_mouse_output().button(BTN_RIGHT, False)
                 state['rightPressed'] = False
 
-            scroll_x = int(joycon.mouseBtn["scrollX"] / 32768)
-            scroll_y = int(joycon.mouseBtn["scrollY"] / 32768)
-            if scroll_x or scroll_y:
-                mouse.scroll(scroll_x, scroll_y)
+            with _pair_state_lock:
+                notches_x = scroll_notches(
+                    state, 'scrollAccX', joycon.mouseBtn["scrollX"]
+                )
+                notches_y = scroll_notches(
+                    state, 'scrollAccY', joycon.mouseBtn["scrollY"]
+                )
+            if notches_x or notches_y:
+                get_mouse_output().scroll(notches_x, notches_y)
 
 
 async def notify_duo_joycons(client, side, data, pair_id: int = 0):
@@ -596,7 +714,7 @@ async def notify_duo_joycons(client, side, data, pair_id: int = 0):
             pair_joycons["Left"].orientation = pair.left.orientation
 
         await pair_joycons["Left"].update(data)
-        await update(pair_id)
+        await update(pair_id, "Left")
     elif side == "Right":
         # Sync orientation from JoyConInfo to the JoyCon instance
         from controller_manager import get_controller_manager
@@ -606,7 +724,7 @@ async def notify_duo_joycons(client, side, data, pair_id: int = 0):
             pair_joycons["Right"].orientation = pair.right.orientation
 
         await pair_joycons["Right"].update(data)
-        await update(pair_id)
+        await update(pair_id, "Right")
     else:
         warning("Unknown controller side.")
 

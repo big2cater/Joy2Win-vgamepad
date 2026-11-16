@@ -24,11 +24,20 @@ logo_files = []
 if logo_file:
     logo_files.append((logo_file, '.'))
 
+# Optional WinUHid user-mode SDK, built locally with tools/build-winuhid.bat.
+# Bundling it lets the single exe use the Raw Input virtual mouse without the
+# user having to place the DLLs beside it (virtual_mouse also checks the exe
+# folder first, so a user-supplied build still wins).
+winuhid_files = []
+for _dll in ('WinUHid.dll', 'WinUHidDevs.dll'):
+    if os.path.exists(_dll):
+        winuhid_files.append((_dll, '.'))
+
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=vgamepad_dlls,
-    datas=logo_files,
+    datas=logo_files + winuhid_files,
     hiddenimports=[
         'vgamepad',
         'vgamepad.win',
@@ -39,8 +48,23 @@ a = Analysis(
         'bleak.backends.winrt',
         'pynput',
         'pynput.mouse',
+        'pynput.keyboard',
         'logger_config',
         'error_handler',
+        # These packages have no __init__ side effects that PyInstaller can
+        # infer through the entry point in every build mode.
+        'control_type',
+        'control_type.duo_joycon',
+        'control_type.single_joycon',
+        'control_type.rumble_stream',
+        'control_type.mouse_scroll',
+        'control_type.virtual_mouse',
+        'controllers',
+        'controllers.JoyconL',
+        'controllers.JoyconR',
+        'controllers.battery',
+        'controllers.hd_rumble',
+        'controllers.stick_calibration',
     ],
     hookspath=[],
     hooksconfig={},

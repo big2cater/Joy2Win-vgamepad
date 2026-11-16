@@ -1,27 +1,30 @@
-"""Joy-Con 2 battery helpers."""
+"""Joy-Con 2 battery helpers.
 
+The 0-9 state-of-charge value in the power-info byte of report 0x07/0x08 is
+authoritative. This module is only a fallback for controllers where that
+report never arrives.
 
-# Approximate Li-ion discharge curve. Joy-Con 2 report 0x05 exposes battery
-# voltage in millivolts, but does not expose the 0-9 state-of-charge value used
-# by the alternate 0x07/0x08 report. Interpolation is substantially more useful
-# than treating the 12-bit millivolt value as a raw percentage.
+Input report 0x05 carries the battery voltage at offset 0x1F, but that reading
+is roughly 0.6 V *below* the real cell voltage (community measurements:
+~3.30 V reported = 75% on the console, ~3.60 V reported = 100%). The old
+standard Li-ion curve (3.3 V = 0%, 4.2 V = 100%) therefore reported a full
+Joy-Con as 5..20% -- see jacc/joy2con issue #1 on firmware 2.1.9.
+
+The anchors below are the Nintendo Joy-Con thresholds (3.3 / 3.6 / 3.9 /
+4.2 V) shifted down by 0.6 V. This is an estimate, not a fuel gauge.
+"""
+
 _VOLTAGE_CURVE = (
-    (3300, 0),
-    (3450, 5),
-    (3550, 10),
-    (3650, 25),
-    (3750, 45),
-    (3850, 65),
-    (3950, 82),
-    (4050, 93),
-    (4150, 98),
-    (4200, 100),
+    (2700, 0),
+    (3000, 10),
+    (3300, 75),
+    (3600, 100),
 )
 
 
 def battery_percentage_from_voltage(voltage_mv: int):
-    """Convert a plausible Joy-Con 2 battery voltage to 0-100 percent."""
-    if not 2500 <= voltage_mv <= 5000:
+    """Convert a reported Joy-Con 2 voltage to an estimated 0-100 percent."""
+    if not isinstance(voltage_mv, int) or not 2400 <= voltage_mv <= 4200:
         return None
 
     if voltage_mv <= _VOLTAGE_CURVE[0][0]:

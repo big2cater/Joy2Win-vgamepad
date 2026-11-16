@@ -28,6 +28,9 @@ _stop_event = threading.Event()
 # pairs.  This is an eight-slot extension used by the Eden integration.
 DSU_SLOT_COUNT = 8
 DSU_CLIENT_TIMEOUT = 10.0
+# DSU clients track packet numbers per slot. A single shared counter makes
+# eight interleaved slot streams look like dropped packets.
+_slot_packet_ids = [0] * DSU_SLOT_COUNT
 
 
 def _valid_client_packet(data):
@@ -91,6 +94,17 @@ def _slot_mac(slot):
 
 
 def _build_packet(payload):
+    # The length field carries the PAYLOAD length, not the whole packet.
+    #
+    # This reads backwards against cemuhook's wording ("size of the packet"), so
+    # it was "fixed" to len(payload) + 16 and Eden immediately stopped
+    # discovering the controller: clients evidently treat the field as bytes
+    # after the header and compute the total themselves. Sending the total made
+    # them wait for a much larger datagram than ever arrives.
+    #
+    # Verified on hardware. Do not change this without re-testing against a real
+    # DSU client -- a protocol reading is not a substitute for observed
+    # behaviour here.
     header = bytearray([
         *b'DSUS',
         0xE9, 0x03,
@@ -98,16 +112,22 @@ def _build_packet(payload):
         0x00, 0x00, 0x00, 0x00,
         *SERVER_ID.to_bytes(4, 'little'),
     ])
+    # crc32 runs over header + payload with the CRC field still zeroed; the
+    # concatenation is a new object, so patching header below cannot leak into
+    # the already-computed value.
     packet = header + payload
     header[8:12] = struct.pack('<I', zlib.crc32(packet) & 0xFFFFFFFF)
     return header + payload
 
-def incrementIdPacket():
+def incrementIdPacket(slot=0):
     global idPacket
-    idPacket += 1
-    if idPacket > 0xFFFFFFFF:  # Reset if it exceeds 32-bit unsigned int
-        idPacket = 1
-    return idPacket
+    if not 0 <= slot < DSU_SLOT_COUNT:
+        slot = 0
+    _slot_packet_ids[slot] += 1
+    if _slot_packet_ids[slot] > 0xFFFFFFFF:
+        _slot_packet_ids[slot] = 1
+    idPacket = _slot_packet_ids[slot]  # keep the legacy global readable
+    return _slot_packet_ids[slot]
 
 ## DSU Server response functions: Controller information ##
 async def responseInfoController(slot=0):
@@ -127,8 +147,7 @@ async def responseInfoController(slot=0):
 
 ## DSU Server response functions: Controller data ##
 async def responseDataController(timestampMotion, accel, gyro, slot=0):
-    global idPacket
-    idPacket = incrementIdPacket()  # Increment packet ID
+    packet_id = incrementIdPacket(slot)
 
     connected, battery_status = _get_slot_info(slot)
     if not isinstance(timestampMotion, int):
@@ -148,7 +167,7 @@ async def responseDataController(timestampMotion, accel, gyro, slot=0):
 
     controllerStats = bytearray([
         0x01 if connected else 0x00,
-        *idPacket.to_bytes(4, 'little'),  # packet ID
+        *packet_id.to_bytes(4, 'little'),  # packet ID
         0b00000000,  # buttons byte 1
         0b00000000,  # buttons byte 2
         0x00,  # HOME
@@ -192,15 +211,20 @@ async def send_message(data, addr):
         return False
 
 ## Initialize DSU server ##
-async def wait_response():
+async def wait_response(listener_sock=None):
     global DSUClientAddr, isReadyToSend, sendWaitClientMsg, sendClientConnectedMsg
     while not _stop_event.is_set():
         try:
             with _socket_lock:
                 current_sock = sock
+            # A listener from an older main_dsu() generation must not consume
+            # packets from a newly bound socket after stop_dsu()/main_dsu().
+            if listener_sock is not None and listener_sock is not current_sock:
+                break
             if current_sock is None:
                 break
-            data, addr = current_sock.recvfrom(1024)
+            reader = listener_sock if listener_sock is not None else current_sock
+            data, addr = reader.recvfrom(1024)
             #print(f"Received data from {addr}: {data.hex()}")
             if len(data) < 20:
                 print(f"Received too short packet: {data.hex()}")
@@ -285,20 +309,33 @@ async def controller_update(timestampBytes, accelBytes, gyroBytes, slot=0):
             await send_message(response, client_addr)
 
 def main_dsu():
+    """Start the DSU listener; return False when UDP 26760 is unavailable."""
     global sendWaitClientMsg, sock, _dsu_thread
     with _socket_lock:
         if sock is None:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind((IP_ADDRESS, PORT))
-            sock.settimeout(1)
-            print(f"DSU Server listening on {IP_ADDRESS}:{PORT}")
+            try:
+                candidate = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                candidate.bind((IP_ADDRESS, PORT))
+                candidate.settimeout(1)
+                sock = candidate
+                print(f"DSU Server listening on {IP_ADDRESS}:{PORT}")
+            except OSError as exc:
+                # Dolphin, DS4Windows or another DSU server often owns this
+                # port. A failure must not take down the GUI.
+                print(f"DSU server unavailable on {PORT}: {exc}")
+                return False
+        owned_sock = sock
+
     # Start (or restart) the listener thread if not running
     if _dsu_thread is None or not _dsu_thread.is_alive():
         _stop_event.clear()
         sendWaitClientMsg = True
         print("Waiting for DSU client to connect...")
-        _dsu_thread = threading.Thread(target=lambda: asyncio.run(wait_response()), daemon=True)
+        _dsu_thread = threading.Thread(
+            target=lambda: asyncio.run(wait_response(owned_sock)), daemon=True
+        )
         _dsu_thread.start()
+    return True
 
 
 def stop_dsu():
@@ -318,3 +355,10 @@ def stop_dsu():
         isReadyToSend = False
         sendWaitClientMsg = False
         sendClientConnectedMsg = False
+
+    # Wait for the old listener to actually exit before another main_dsu()
+    # can bind a fresh socket. Without this, two threads read the same socket
+    # and client subscriptions are processed twice.
+    thread = _dsu_thread
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=2.0)

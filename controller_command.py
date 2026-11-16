@@ -9,13 +9,24 @@ UUID_POWER_RIGHT = "d5a9e01e-2ffc-4cca-b20c-8b67142bf442"
 COMMAND_TYPE = {
     "JOY2_CONNECTED_VIBRATION": {"data": "0A9101020004000003000000", "wait_response": True, "args": None},
 
-    "JOY2_SET_PLAYER_LED": {"data": "09910007000800000X00000000000000", "wait_response": True, "args": [{"name": "led_player", "letter": "X", "length": 1}]},
+    # LED writes are occasionally dropped on real hardware (community
+    # measurements: resend up to 5 times, ~300 ms apart, until the echo).
+    "JOY2_SET_PLAYER_LED": {"data": "09910007000800000X00000000000000", "wait_response": True, "attempts": 5, "retry_delay": 0.3, "args": [{"name": "led_player", "letter": "X", "length": 1}]},
 
-    "JOY2_INIT_SENSOR_DATA": {"data": "0c91010200040000FF000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
+    # FEATSEL 0xB7 = 0xFF with bits 0x08 and 0x40 cleared.
+    #
+    # Switch2Connect records that enabling every feature bit makes the Joy-Con
+    # emit extra report fields which surface as phantom ZL/ZR presses, firing
+    # those triggers continuously. Their known-good build uses 0x94
+    # (motion 0x04 | mouse 0x10 | magnetometer 0x80) and jacc/joy2con uses
+    # 0x37; both leave bits 0x08 and 0x40 clear, which is the only property
+    # they share. Clearing just those two keeps everything else as it was, so
+    # no sensor or rumble feature silently changes.
+    "JOY2_INIT_SENSOR_DATA": {"data": "0c91010200040000B7000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
 
-    "JOY2_FINALIZE_SENSOR_DATA": {"data": "0c91010300040000FF000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
+    "JOY2_FINALIZE_SENSOR_DATA": {"data": "0c91010300040000B7000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
 
-    "JOY2_START_SENSOR_DATA": {"data": "0c91010400040000FF000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
+    "JOY2_START_SENSOR_DATA": {"data": "0c91010400040000B7000000", "wait_response": True, "args": None}, #Thanks to "Narr the Reg" and "ndeadly"
 
     # Official Joy-Con 2 battery-voltage query. The four-byte payload begins
     # at response offset 8 and stores millivolts as little-endian uint16.
@@ -38,17 +49,33 @@ class ControllerCommand:
     clientSending = None
     expectedResponse = None
     lastResponse = None
-    _lock = asyncio.Lock()
+    _lock = None  # created per instance in __new__, see below
     RESPONSE_TIMEOUT = 3.0
     MAX_ATTEMPTS = 2
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(ControllerCommand, cls).__new__(cls)
+            instance = super(ControllerCommand, cls).__new__(cls)
+            # A class-level asyncio.Lock is created at import time and can end
+            # up bound to a different loop than the one running BLE commands
+            # (the GUI creates several loops). Create it lazily per loop.
+            instance._lock = None
+            instance._lock_loop = None
+            instance._responses = {}
+            cls._instance = instance
         return cls._instance
 
+    async def _get_lock(self):
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
+
     async def send_command(self, client, commandType, args=None):
-        async with self._lock:
+        self._responses.pop(client, None)
+        lock = await self._get_lock()
+        async with lock:
             try:
                 self.onSendCmd = True
                 self.clientSending = client
@@ -76,7 +103,9 @@ class ControllerCommand:
 
                 #print(f"Sending command: {commandType} with data: {data_bytes.hex()}")
 
-                attempts = self.MAX_ATTEMPTS if command["wait_response"] else 1
+                attempts = (command.get("attempts", self.MAX_ATTEMPTS)
+                            if command["wait_response"] else 1)
+                retry_delay = command.get("retry_delay", 0.1)
                 for attempt in range(1, attempts + 1):
                     self.cmdAnswered = False
                     self.responseSucceeded = False
@@ -94,7 +123,7 @@ class ControllerCommand:
                         return True
 
                     if attempt < attempts:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(retry_delay)
 
                 raise asyncio.TimeoutError(
                     f"No successful response for {commandType} after {attempts} attempts"
@@ -113,4 +142,12 @@ class ControllerCommand:
                 and self.expectedResponse == (data[0], data[2], data[3])):
             self.responseSucceeded = data[1] == 0x01
             self.lastResponse = bytes(data)
+            # Keep a per-client copy. Two Joy-Cons initialising concurrently
+            # used to race on the single global lastResponse, so a battery
+            # voltage query could decode another controller's reply.
+            self._responses[client] = bytes(data)
             self.cmdAnswered = True
+
+    def get_last_response(self, client):
+        """Consume the response captured for one specific BLE client."""
+        return self._responses.pop(client, None)

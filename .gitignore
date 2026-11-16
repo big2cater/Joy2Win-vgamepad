@@ -7,3 +7,12 @@ config.ini
 *.backup
 /build
 /dist
+/dist-*/
+# WinUHid user-mode SDK (built locally, not part of this repo)
+WinUHid.dll
+WinUHidDevs.dll
+tools/WinUHid-src/
+tools/*.exe
+
+# Release archives are uploaded to GitHub Releases, not committed
+*.zip

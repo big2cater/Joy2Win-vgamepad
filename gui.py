@@ -6,12 +6,25 @@ A modern UI for Joy-Con 2 Windows compatibility
 
 import sys
 import asyncio
+import threading
+import warnings
+import concurrent.futures
+
+# PyQt5 5.15.9 with Python 3.12 emits one sipPyTypeDict() deprecation per class
+# definition. It is harmless but buries the startup log, so mute that message
+# only -- everything else still surfaces.
+warnings.filterwarnings(
+    "ignore",
+    message=r"sipPyTypeDict\(\) is deprecated.*",
+    category=DeprecationWarning,
+)
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit, QGroupBox, QCheckBox,
     QProgressBar, QFrame, QSplitter, QMessageBox, QSystemTrayIcon, QMenu,
     QComboBox, QFormLayout, QDialog, QGridLayout, QListWidget, QListWidgetItem,
-    QScrollArea, QTabWidget
+    QScrollArea, QTabWidget, QSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QMetaObject, QPoint, Q_ARG
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QBrush, QPolygon, QPen
@@ -386,6 +399,30 @@ class ControllerPairTab(QWidget):
         self.mouse_check.setStyleSheet("color: white;")
         self.mouse_check.stateChanged.connect(self.on_mouse_changed)
         settings_layout.addRow("", self.mouse_check)
+
+        # Pointer speed. The value is global (one config key shared by every
+        # pair), so on_mouse_sensitivity_changed mirrors it to the other tabs.
+        self.mouse_sensitivity = QSpinBox()
+        self.mouse_sensitivity.setRange(10, 400)
+        self.mouse_sensitivity.setSingleStep(10)
+        self.mouse_sensitivity.setValue(int(Config().mouse_sensitivity))
+        self.mouse_sensitivity.setSuffix(" %")
+        self.mouse_sensitivity.setToolTip(
+            "鼠标指针速度：100 为默认，数值越大越快"
+        )
+        self.mouse_sensitivity.setStyleSheet("""
+            QSpinBox {
+                padding: 4px;
+                border: 1px solid #555;
+                border-radius: 3px;
+                background-color: #333;
+                color: white;
+            }
+        """)
+        self.mouse_sensitivity.valueChanged.connect(
+            self.on_mouse_sensitivity_changed
+        )
+        settings_layout.addRow("鼠标灵敏度:", self.mouse_sensitivity)
         
         # DSU slot
         self.dsu_check = QCheckBox("启用 DSU 体感映射")
@@ -400,6 +437,32 @@ class ControllerPairTab(QWidget):
         self.vibration_check.setChecked(True)
         self.vibration_check.stateChanged.connect(self.on_vibration_changed)
         settings_layout.addRow("", self.vibration_check)
+
+        # Vibration strength. One config key shared by every pair, so the value
+        # is mirrored to the other tabs; the running stream is updated in place
+        # instead of waiting for the next connection.
+        self.rumble_strength = QSpinBox()
+        self.rumble_strength.setRange(0, 100)
+        self.rumble_strength.setSingleStep(5)
+        self.rumble_strength.setValue(int(Config().rumble_strength))
+        self.rumble_strength.setSuffix(" %")
+        self.rumble_strength.setToolTip(
+            "震动强度：0 为静音，100 为协议安全上限（约满幅的 44%）\n"
+            "调低可消除敲击声，调高会更实"
+        )
+        self.rumble_strength.setStyleSheet("""
+            QSpinBox {
+                padding: 4px;
+                border: 1px solid #555;
+                border-radius: 3px;
+                background-color: #333;
+                color: white;
+            }
+        """)
+        self.rumble_strength.valueChanged.connect(
+            self.on_rumble_strength_changed
+        )
+        settings_layout.addRow("震动强度:", self.rumble_strength)
         
         # Button mapping button
         self.mapping_btn = QPushButton("SL/SR 按键映射")
@@ -566,6 +629,53 @@ class ControllerPairTab(QWidget):
         duo_set_mouse(self.pair_id, enabled)
         single_set_mouse(self.pair_id, enabled)
     
+    def on_rumble_strength_changed(self, value):
+        """Persist the strength, push it to the live stream, mirror to other tabs.
+
+        ``RumbleStream.set_strength`` only changes the amplitude scale, so the
+        next packet sent uses the new value -- no reconnection needed.
+        """
+        config = Config()
+        if not config.set_and_save("rumble_strength", int(value)):
+            config.rumble_strength = int(value)
+        try:
+            from control_type.rumble_stream import get_rumble_stream
+            get_rumble_stream().set_strength(int(value))
+        except Exception as exc:
+            warning(f"Rumble strength update failed: {exc}")
+        info(f"Rumble strength set to {value}%")
+        for tab in getattr(self.window(), "controller_tabs", []):
+            if tab is self:
+                continue
+            spin = getattr(tab, "rumble_strength", None)
+            if spin is None:
+                continue
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+
+    def on_mouse_sensitivity_changed(self, value):
+        """Persist the pointer speed and mirror it to the other pair tabs.
+
+        The value lives in one config key shared by every pair, so a change in
+        one tab has to be reflected in the others or the UI would disagree with
+        the running setting.
+        """
+        config = Config()
+        if not config.set_and_save("mouse_sensitivity", int(value)):
+            # No config.ini (or it is read-only): still apply it in memory.
+            config.mouse_sensitivity = int(value)
+        info(f"Mouse sensitivity set to {value}%")
+        for tab in getattr(self.window(), "controller_tabs", []):
+            if tab is self:
+                continue
+            spin = getattr(tab, "mouse_sensitivity", None)
+            if spin is None:
+                continue
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+
     def on_orientation_changed(self, index):
         """Handle orientation combo box change"""
         orientation = self.orientation_combo.currentData()
@@ -588,36 +698,36 @@ class ControllerPairTab(QWidget):
                 info(f"Updated Right Joy-Con orientation to {orientation}")
     
     def on_dsu_changed(self, state):
-        """Handle DSU checkbox change"""
+        """Handle DSU checkbox change for this pair only.
+
+        Each tab used to force every other tab to the same value while the
+        input path only read one global config flag, so the advertised
+        "per-pair DSU" toggle did nothing. Now every pair gets an explicit
+        state and the UDP listener runs while at least one pair needs it.
+        """
         enabled = state == Qt.Checked
-        info(f"DSU {'enabled' if enabled else 'disabled'}")
-        
-        # Update config
+        info(f"DSU {'enabled' if enabled else 'disabled'} for pair {self.pair_id + 1}")
+
         try:
-            from config import Config
-            config = Config()
-            config.enable_dsu = enabled
+            from control_type import duo_joycon, single_joycon
+            from dsu_server import main_dsu, stop_dsu
+
             window = self.window()
-            for tab in getattr(window, 'controller_tabs', []):
-                if tab is self:
-                    continue
-                tab.dsu_check.blockSignals(True)
-                tab.dsu_check.setChecked(enabled)
-                tab.dsu_check.blockSignals(False)
-            
-            persist_dsu_setting(enabled)
-            info(f"DSU setting saved to config")
-            if enabled:
-                # Enabling DSU while the app is already running must also
-                # start its listener; previously this only took effect after
-                # a full restart.
-                from dsu_server import main_dsu
+            tabs = getattr(window, 'controller_tabs', []) or [self]
+            for tab in tabs:
+                tab_enabled = tab.dsu_check.isChecked()
+                duo_joycon.set_dsu_enabled(tab.pair_id, tab_enabled)
+                single_joycon.set_dsu_enabled(tab.pair_id, tab_enabled)
+
+            any_enabled = any(tab.dsu_check.isChecked() for tab in tabs)
+            # Persist the server's start-up default, not a per-pair value.
+            persist_dsu_setting(any_enabled)
+            if any_enabled:
                 main_dsu()
             else:
-                from dsu_server import stop_dsu
                 stop_dsu()
         except Exception as e:
-            error(f"Failed to save DSU setting: {e}")
+            error(f"Failed to apply DSU setting: {e}")
     
     def on_vibration_changed(self, state):
         """Handle vibration checkbox change"""
@@ -654,18 +764,28 @@ class ScanThread(QThread):
     scan_finished = pyqtSignal(list)
     scan_error = pyqtSignal(str)
 
+    def __init__(self, timeout=30.0):
+        super().__init__()
+        from threading import Event
+        self._stop_event = Event()
+        self.timeout = timeout
+
+    def stop(self):
+        """Ask the BLE scan to finish so this QThread can actually exit."""
+        self._stop_event.set()
+
     def run(self):
         """Run the scan"""
+        loop = None
         try:
             import main
-            # Run async scan in new event loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            # Scan for first device (original Joy2Win style)
-            device = loop.run_until_complete(main.scan_for_joycons())
-            loop.close()
-            
+
+            device = loop.run_until_complete(
+                main.scan_for_joycons(timeout=self.timeout, stop_event=self._stop_event)
+            )
+
             # Convert to list format for compatibility
             devices = []
             if device:
@@ -702,6 +822,13 @@ class ScanThread(QThread):
             self.scan_finished.emit(devices)
         except Exception as e:
             self.scan_error.emit(str(e))
+        finally:
+            if loop is not None:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+            asyncio.set_event_loop(None)
 
 
 class ConnectThread(QThread):
@@ -742,7 +869,14 @@ class ConnectThread(QThread):
             )
             
             # Wait for result with timeout
-            success = future.result(timeout=15.0)
+            try:
+                success = future.result(timeout=15.0)
+            except Exception:
+                # The coroutine keeps running in the global loop after the GUI
+                # gives up. Cancel it so a late success cannot leave the UI and
+                # the controller manager out of sync.
+                future.cancel()
+                raise
             
             # Emit result
             self.connect_finished.emit(self.device_info.get('name', 'Unknown'), self.pair_id, success)
@@ -780,13 +914,23 @@ class DisconnectThread(QThread):
             )
             
             # Wait for result with timeout
-            future.result(timeout=5.0)
+            future.result(timeout=8.0)
             
             # Emit result
             self.disconnect_finished.emit(self.pair_id)
-            
+
+        except concurrent.futures.TimeoutError:
+            # str(TimeoutError()) is empty, which used to surface in the UI as
+            # a blank "断开出错: " even though the disconnect completed
+            # afterwards in the background loop.
+            self.disconnect_error.emit(
+                self.pair_id,
+                "等待超过 8 秒，断开仍在后台继续；若手柄未断开请再点一次",
+            )
         except Exception as e:
-            self.disconnect_error.emit(self.pair_id, str(e))
+            self.disconnect_error.emit(
+                self.pair_id, f"{type(e).__name__}: {e}"
+            )
 
 
 class AddControllerDialog(QDialog):
@@ -930,6 +1074,25 @@ class AddControllerDialog(QDialog):
         # Auto-start scanning
         QTimer.singleShot(100, self.start_scan)
     
+    def stop_scan(self):
+        """Stop the background BLE scan when the dialog is dismissed."""
+        thread = getattr(self, "scan_thread", None)
+        if thread is not None:
+            thread.stop()
+            thread.wait(5000)
+
+    def reject(self):
+        self.stop_scan()
+        super().reject()
+
+    def accept(self):
+        self.stop_scan()
+        super().accept()
+
+    def closeEvent(self, event):
+        self.stop_scan()
+        super().closeEvent(event)
+
     def start_scan(self):
         """Start scanning for devices"""
         self.status_label.setText("正在扫描...请长按同步按钮")
@@ -1300,14 +1463,11 @@ class Joy2WinGUI(QMainWindow):
             self.show_and_raise()
 
     def quit_application(self):
-        """真正退出应用程序"""
-        # Stop the status timer
+        """Cleanly release BLE links, the DSU port and the event loop."""
         self.status_timer.stop()
 
-        # Check if any controllers are connected
         manager = get_controller_manager()
         active_pairs = manager.get_active_pairs()
-
         if active_pairs:
             reply = QMessageBox.question(
                 self, "确认退出",
@@ -1317,17 +1477,30 @@ class Joy2WinGUI(QMainWindow):
             if reply == QMessageBox.No:
                 return
 
-        # Restore stdout/stderr before exit
+        info("Shutting down Joy2Win...")
+        try:
+            import main as main_module
+            loop = main_module.get_event_loop()
+            if loop is not None and not loop.is_closed():
+                future = asyncio.run_coroutine_threadsafe(
+                    main_module.shutdown(), loop
+                )
+                try:
+                    future.result(timeout=8.0)
+                except Exception as exc:
+                    warning(f"Shutdown cleanup incomplete: {exc}")
+            else:
+                from dsu_server import stop_dsu
+                stop_dsu()
+        except Exception as exc:
+            warning(f"Shutdown cleanup failed: {exc}")
+
+        self.tray_icon.hide()
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
-
-        # Hide tray icon
-        self.tray_icon.hide()
-
-        # Force exit immediately
-        info("Force exiting...")
-        import os
-        os._exit(0)
+        # os._exit(0) skipped every finally block and left BLE devices, the
+        # UDP socket and virtual gamepads to be torn down by the OS.
+        QApplication.instance().quit()
 
     def open_button_mapping_for_pair(self, pair_id: int):
         """Open button mapping dialog for specific pair"""
@@ -1560,10 +1733,81 @@ class Joy2WinGUI(QMainWindow):
         )
 
 
+def _log_runtime_versions():
+    """Log the interpreter and BLE stack actually in use.
+
+    Running the GUI with a different interpreter than the venv is the most
+    common startup failure: bleak 3.x renamed APIs that the pinned 0.21.1
+    build exposes, so the app dies with a puzzling AttributeError. Printing
+    the real versions turns that into an obvious environment mismatch.
+    """
+    try:
+        import importlib.metadata as md
+    except ImportError:  # pragma: no cover - stdlib since 3.8
+        return
+    info(f"Python {sys.version.split()[0]} | {sys.executable}")
+    versions = []
+    for pkg in ("bleak", "PyQt5", "vgamepad", "pynput"):
+        try:
+            versions.append(f"{pkg}={md.version(pkg)}")
+        except Exception:
+            versions.append(f"{pkg}=missing")
+    info("Dependencies: " + ", ".join(versions))
+    try:
+        if md.version("bleak").split(".")[0] != "0":
+            warning(
+                "bleak is not the pinned 0.21.x build expected by this app. "
+                "Start the GUI through start-gui.bat so the venv interpreter "
+                "is used, otherwise connection handling may fail."
+            )
+    except Exception:
+        pass
+
+
+def _install_exception_hooks():
+    """Keep the window alive when a slot or thread raises.
+
+    PyQt5 (>= 5.5) calls qFatal() on an uncaught exception inside a slot, so the
+    app disappears with no message and no traceback -- exactly what a wrong
+    attribute access in a valueChanged handler looks like. Log it, tell the
+    user, and keep running instead.
+    """
+    import traceback
+
+    def hook(exc_type, exc_value, exc_tb):
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            error(f"Uncaught exception:\n{text}")
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(
+                None,
+                "Joy2Win 发生错误",
+                f"{exc_type.__name__}: {exc_value}\n\n详情已写入 joy2win.log",
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = hook
+
+    def thread_hook(args):
+        hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = thread_hook
+
+
 def main():
-    import sys
-    import threading
-    
+    # A frozen build unpacks itself into %TEMP%, and the working directory is
+    # whatever the launcher chose (a shortcut can start elsewhere). Anchor it to
+    # the executable's folder so config.ini and joy2win.log always sit next to
+    # the exe instead of scattering or silently falling back to defaults.
+    if getattr(sys, "frozen", False):
+        os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
+
+    _install_exception_hooks()
+    _log_runtime_versions()
+
     app = QApplication(sys.argv)
     
     # Set application style
@@ -1577,7 +1821,11 @@ def main():
     
     # Create and start the global event loop (like original Joy2Win)
     import main as main_module
-    
+
+    # Millisecond timer period: without it asyncio.sleep(12ms) rounds to the
+    # 15.6 ms system tick and the rumble cadence halves.
+    main_module.raise_timer_resolution()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     main_module.set_event_loop(loop)
@@ -1593,10 +1841,28 @@ def main():
     window.show()
     
     exit_code = app.exec_()
-    
-    # Stop the event loop on exit
-    loop.call_soon_threadsafe(loop.stop)
-    
+
+    try:
+        main_module.restore_timer_resolution()
+    except Exception:
+        pass
+
+    # Quit paths already ran main.shutdown(); this is the safety net for any
+    # other way the Qt event loop is left.
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        # The loop can already be closed when shutdown() took the slow path;
+        # raising here would skip the DSU cleanup and sys.exit below.
+        pass
+    if loop_thread.is_alive():
+        loop_thread.join(timeout=2.0)
+    try:
+        from dsu_server import stop_dsu
+        stop_dsu()
+    except Exception:
+        pass
+
     sys.exit(exit_code)
 
 
